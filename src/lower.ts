@@ -811,6 +811,10 @@ class Lowerer {
             case "NumberLiteral": return luau.number(node.value, node.raw)
             case "StringLiteral": return luau.string(node.value)
             case "VarargExpression": return vararg()
+            // Only a recovering parse makes one, and a syntax error stops the build.
+            case "ErrorExpression":
+                this.report(node, "Syntax error")
+                return luau.nil()
             case "InterpolatedStringExpression": return this.interpolatedString(node)
 
             case "FunctionExpression":
