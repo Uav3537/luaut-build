@@ -341,7 +341,15 @@ function analyzeModules(
     }
 
     for (const module of modules) {
-        const scopes = analyzeScopes(module.program, { builtinGlobals: globals })
+        // Without a type library even `print` is undeclared: only check names
+        // against libraries that are there.
+        const scopes = analyzeScopes(module.program, { builtinGlobals: globals, reportUndeclared: libs.length > 0 })
+        // A name nothing declares is reported, but builds: in Luau it is a
+        // global that reads as nil, not a program that cannot be compiled.
+        for (const d of scopes.diagnostics) {
+            if (d.kind !== "undeclared") continue
+            out.push({ file: module.file, message: d.message, line: d.node.line.start, column: d.node.column.start, category: "type" })
+        }
         const types = analyzeTypes(module.program, scopes, { libs, resolveModule: resolverFor(module.file) })
         analyses.set(module.file, types)
         for (const d of types.diagnostics) {

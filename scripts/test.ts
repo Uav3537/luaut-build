@@ -464,6 +464,13 @@ function fails(name: string, result: BundleResult, message: string): void {
     check("bundle: directives suppress scope and type errors, and an unused expect-error is one",
         loud.diagnostics.map(d => `${d.line}: ${d.message}`),
         ["4: Type '\"x\"' is not assignable to 'number'", "4: Unused '@luaut-expect-error' directive", "5: Unused '@luaut-expect-error' directive"])
+    const unknown = project({
+        "main.luaut": `counter = 1\nprint(counter)\nprint(typo)\n`,
+        "defs.d.luaut": `declare function print(...: unknown): ()\n`,
+    })
+    const withUnknown = bundle({ entry: join(unknown, "main.luaut"), config: { types: ["./defs.d.luaut"] } })
+    check("bundle: a name nothing declares is reported, and still builds",
+        [withUnknown.diagnostics.map(d => d.message), withUnknown.code !== undefined], [["Cannot find name 'typo'"], true])
     const quiet = bundle({ entry: join(root, "quiet.luaut"), config: { types: [] } })
     check("bundle: nocheck builds a file with scope errors", [quiet.diagnostics, quiet.code !== undefined], [[], true])
 }
