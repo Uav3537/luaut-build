@@ -1,0 +1,48 @@
+{
+  "name": "luaut-build",
+  "version": "0.1.0",
+  "description": "Compiles luaut to Luau: lowers the luaut-parser AST to a luau-parser AST and prints it",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "luaut-build": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": {
+        "require": "./dist/index.d.cts",
+        "import": "./dist/index.d.ts"
+      },
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "scripts": {
+    "test": "tsx scripts/test.ts",
+    "build": "tsup",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "luaut",
+    "luau",
+    "roblox",
+    "compiler"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "luau-parser": "^1.0.3",
+    "luaut-parser": "^2.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3"
+  }
+}
