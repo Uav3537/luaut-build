@@ -1,6 +1,6 @@
 {
   "name": "luaut-build",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Compiles luaut to Luau: lowers the luaut-parser AST to a luau-parser AST and prints it",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -37,7 +37,7 @@
   "type": "module",
   "dependencies": {
     "luau-parser": "^1.0.3",
-    "luaut-parser": "^2.1.0"
+    "luaut-parser": "^3.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.2",

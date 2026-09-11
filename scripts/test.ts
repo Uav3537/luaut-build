@@ -100,10 +100,10 @@ lowers("interpolation escapes percent signs and keeps braces",
 lowers("a template without interpolation is a string", "print(`plain`)", `print("plain");`)
 
 // --- functions -------------------------------------------------------------------
-lowers("const function is a local function", "const function f(a: number): number\n    return a\nend", "local function f(a) return a; end;")
-lowers("parameter defaults", "const function f(a = 1)\nend", "local function f(a) if a == nil then a = 1; end; end;")
+lowers("function is a local function", "function f(a: number): number\n    return a\nend", "local function f(a) return a; end;")
+lowers("parameter defaults", "function f(a = 1)\nend", "local function f(a) if a == nil then a = 1; end; end;")
 lowers("destructured parameters",
-    "const function f({ x, y }, [z])\nend", "local function f(arg, arg2) local x, y = arg.x, arg.y; local z = arg2[1]; end;")
+    "function f({ x, y }, [z])\nend", "local function f(arg, arg2) local x, y = arg.x, arg.y; local z = arg2[1]; end;")
 lowers("methods keep ':' and drop the injected self",
     "holder = {}\nfunction holder:go(n: number)\n    return self\nend", "holder = {}; function holder:go(n) return self; end;")
 lowers("function expressions", "const f = function(a = 2) return a end", "local f = function(a) if a == nil then a = 2; end; return a; end;")
@@ -117,7 +117,7 @@ lowers("generated names avoid the source's", "const ref = 1\nconst { a } = f()",
 lowers("for x in a table yields the values", "const list = [1, 2]\nfor v in list do print(v) end",
     "local list = { 1, 2 }; for _, v in list do print(v); end;")
 lowers("an iterator function keeps its own values", "for k in pairs(t) do print(k) end", "for k in pairs(t) do print(k); end;")
-lowers("attributes are kept", "@native\nconst function f(x: number): number\n    return x\nend", "@native local function f(x) return x; end;")
+lowers("attributes are kept", "@native\nfunction f(x: number): number\n    return x\nend", "@native local function f(x) return x; end;")
 lowers("a shadowed global the output needs is captured first",
     "const table = {}\nconst [a, ...rest] = list\nprint(`${a}`)",
     `local luaut_table = table; local table = {}; local a = list[1]; local rest = luaut_table.move(list, 2, #list, 1, {}); print(("%s"):format(tostring(a)));`)
@@ -168,11 +168,34 @@ function runs(name: string, result: BundleResult, expected: string[]): void {
     if (output) check(name, output, expected)
 }
 
+/** Run a bundle that should fail, and check its error mentions `message`. */
+function fails(name: string, result: BundleResult, message: string): void {
+    if (result.code === undefined) {
+        failures.push(`${name}\n    no bundle: ${result.diagnostics.map(d => d.message).join("; ")}`)
+        return
+    }
+    validLuau(name, result.code)
+    if (!luauBinary) {
+        skipped++
+        return
+    }
+    const file = join(mkdtempSync(join(tmpdir(), "luaut-run-")), "bundle.luau")
+    writeFileSync(file, result.code)
+    try {
+        execFileSync(luauBinary, [file], { encoding: "utf8", stdio: "pipe" })
+        failures.push(`${name}\n    the bundle ran without an error`)
+    } catch (error) {
+        const output = `${(error as { stderr?: string }).stderr ?? ""}${(error as { stdout?: string }).stdout ?? ""}`
+        check(name, output.includes(message), true)
+        if (!output.includes(message)) failures.push(`    got: ${output.trim()}`)
+    }
+}
+
 {
     const root = project({
         "luaut.config.json": JSON.stringify({ types: [], paths: { "@/*": ["src/*"] }, sourceMap: null }),
         "src/main.luaut": `import { twice } from "./math"\nimport { NAME } from "@/names"\nprint(twice(21), NAME)\n`,
-        "src/math.luaut": "export const function twice(n: number): number\n    return n * 2\nend\n",
+        "src/math.luaut": "export function twice(n: number): number\n    return n * 2\nend\n",
         "src/names.luaut": `export const NAME = "luaut"\n`,
     })
     const result = bundle({ entry: join(root, "src/main.luaut") })
@@ -188,21 +211,73 @@ function runs(name: string, result: BundleResult, expected: string[]): void {
         "a.luaut": [
             `import { readLate } from "./b"`,
             `export let counter = 0`,
-            `export const function a1(): string return "a1" end`,
-            `export const function hoisted(): string return "hoisted" end`,
-            `export const function bump() counter += 1 end`,
+            `export function a1(): string return "a1" end`,
+            `export function hoisted(): string return "hoisted" end`,
+            `export function bump() counter += 1 end`,
             `export const late = "late"`,
             `print("a sees", readLate())`,
         ].join("\n"),
         "b.luaut": [
             `import { hoisted, late } from "./a"`,
-            `print("b during the cycle", hoisted(), late)`,
-            `export const function readLate(): string return late end`,
+            `print("b during the cycle", hoisted())`,
+            `export function readLate(): string return late end`,
         ].join("\n"),
     })
     runs("bundle: a cycle sees hoisted functions at once, and later values live",
         bundle({ entry: join(root, "main.luaut"), config: { types: [] } }),
-        ["b during the cycle\thoisted\tnil", "a sees\tlate", "main\ta1", "counter\t2"])
+        ["b during the cycle\thoisted", "a sees\tlate", "main\ta1", "counter\t2"])
+}
+
+{
+    // Reading what the other module has not initialized yet is an error, as in ES modules.
+    const root = project({
+        "main.luaut": `import { value } from "./a"\nprint(value)\n`,
+        "a.luaut": `import { early } from "./b"\nexport const value = early\n`,
+        "b.luaut": `import { value } from "./a"\nexport const early = value\n`,
+    })
+    fails("bundle: a value read across a cycle before it is initialized is an error",
+        bundle({ entry: join(root, "main.luaut"), config: { types: [] } }),
+        "Cannot access 'value' before initialization: 'a' has not reached it yet")
+}
+
+{
+    // Re-exports are references: a later change shows through them.
+    const root = project({
+        "main.luaut": `import { count, bump } from "./re"\nimport * as All from "./all"\nprint(count, All.count)\nbump()\nprint(count, All.count)\n`,
+        "state.luaut": `export let count = 0\nexport function bump() count += 1 end\n`,
+        "re.luaut": `export { count, bump } from "./state"\n`,
+        "all.luaut": `export * from "./state"\n`,
+    })
+    runs("bundle: re-exports and export * stay live",
+        bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["0\t0", "1\t1"])
+}
+
+{
+    const root = project({
+        "main.luaut": `import * as Util from "./util"\nprint(Util.twice(4), Util.NAME, Util.default)\n`,
+        "util.luaut": `export function twice(n: number): number return n * 2 end\nexport const NAME = "util"\nexport default true\n`,
+    })
+    runs("bundle: import * as", bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["8\tutil\ttrue"])
+}
+
+{
+    const root = project({
+        "main.luaut": `import { value } from "./m"\nvalue = 2\n`,
+        "m.luaut": `export let value = 1\n`,
+    })
+    const result = bundle({ entry: join(root, "main.luaut"), config: { types: [] } })
+    check("bundle: assigning to an import is an error, and leaves no bundle",
+        [result.code, result.diagnostics.map(d => [d.category, d.message])],
+        [undefined, [["scope", "Cannot assign to 'value' — it is an import"]]])
+}
+
+{
+    const root = project({
+        "main.luaut": `import { later, set } from "./m"\nprint(later)\nset()\nprint(later)\n`,
+        "m.luaut": `export let later\nexport function set() later = "set" end\n`,
+    })
+    runs("bundle: `export let` without a value is initialized to nil",
+        bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["nil", "set"])
 }
 
 {
@@ -260,7 +335,7 @@ function runs(name: string, result: BundleResult, expected: string[]): void {
             `let count = 0`,
             `for key in pairs(others) do count += 1 end`,
             `const [first, , third = "three", ...tail] = ["one", "two", nil, "four", "five"]`,
-            `const function sum({ a, b = 10 }: { a: number, b?: number }, scale = 1): number`,
+            `function sum({ a, b = 10 }: { a: number, b?: number }, scale = 1): number`,
             `    return (a + b) * scale`,
             `end`,
             `const values = [0, ...[1, 2], sum({ a: 1 }), sum({ a: 1, b: 1 }, 2)]`,

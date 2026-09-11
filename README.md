@@ -51,32 +51,29 @@ result.diagnostics   // { file, line, column, message, category: "syntax" | "mod
 
 ## Modules
 
-Roblox's `require` takes an Instance, so the bundle has its own:
+Roblox's `require` takes an Instance, so the bundle has its own. Each module
+is an entry in one table:
 
 ```lua
 local G
 G = {
     modules = {
-        ["src/util"] = function(exports)
-            exports.clamp = function(x, lo, hi) ... end
-        end,
-        ["src/main"] = function(exports)
-            local util
-            util = G.require("src/util")
-            print(util.clamp(5, 0, 1))
-        end,
+        ["src/util"] = {
+            names = { clamp = true },
+            load = function(exports)
+                function exports.clamp(x, lo, hi) ... end
+            end,
+        },
+        ["src/main"] = {
+            load = function(exports)
+                local util
+                util = G.require("src/util")
+                print(util.clamp(5, 0, 1))
+            end,
+        },
     },
     records = {},
-    require = function(name)
-        local record = G.records[name]
-        if record == nil then
-            record = { loading = true, exports = {} }
-            G.records[name] = record
-            G.modules[name](record.exports)
-            record.loading = false
-        end
-        return record.exports
-    end,
+    require = function(name) ... end,
 }
 G.require("src/main")
 ```
@@ -92,14 +89,18 @@ Modules follow ES module rules, including when they import each other:
   exports as they stand instead of loading `a` again.
 - **Hoisting.** Every top-level function is defined before a module's imports
   run, so `b` can call `a`'s functions in the middle of that cycle.
+- **Initialization.** Reading an export its module has not initialized yet is
+  an error — `Cannot access 'x' before initialization` — as reading a `let`
+  before its declaration is in JavaScript.
 - **Live bindings.** Exports live on the module's `exports` table and imports
-  are read through it (`util.clamp`, never a copy). A value `a` sets after `b`
-  ran — or a `let` it changes later — is what `b` sees.
+  are read through it (`util.clamp`, never a copy), so a value set later — or
+  a `let` changed later — is what the importer sees. Re-exports
+  (`export { x } from`) and `export *` are references too: they read the
+  other module on every access.
+- **Read-only imports.** Assigning to an imported name, or to a member of a
+  namespace (`import * as M`, then `M.x = 1`), is an error.
 - **Types only.** An import used only as a type is dropped. A module imported
   only for types is left out of the bundle.
-
-A value read across a cycle before its module has set it is `nil`, where an ES
-module would throw.
 
 ## Tests
 

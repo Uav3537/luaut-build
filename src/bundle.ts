@@ -2,32 +2,42 @@
  * A luaut project -> one Luau file.
  *
  * Roblox's `require` takes an Instance, so a bundle cannot use it between its
- * own modules. Instead every module becomes a function in one table, loaded
- * by a `require` of the bundle's own:
+ * own modules. Instead every module becomes an entry in one table, loaded by a
+ * `require` of the bundle's own:
  *
  *   local G
  *   G = {
  *       modules = {
- *           ["src/util"] = function(exports)
- *               exports.clamp = function(x) ... end
- *           end,
- *           ["src/main"] = function(exports)
- *               local util
- *               util = G.require("src/util")
- *               print(util.clamp(2))
- *           end,
+ *           ["src/util"] = {
+ *               names = { clamp = true },
+ *               load = function(exports)
+ *                   function exports.clamp(x) ... end
+ *               end,
+ *           },
+ *           ["src/main"] = {
+ *               load = function(exports)
+ *                   local util
+ *                   util = G.require("src/util")
+ *                   print(util.clamp(2))
+ *               end,
+ *           },
  *       },
  *       records = {},
  *       require = function(name) ... end,
  *   }
  *   G.require("src/main")
  *
- * A module's record is created, with `loading = true`, before its function
- * runs. That is what makes a cycle behave like ES modules rather than loop
- * forever: when `a` imports `b` and `b` imports `a` back, `b` gets `a`'s
- * exports table as it stands — partly filled, but already holding `a`'s
- * hoisted functions — and every value `a` exports later shows up in it, since
- * modules read each other's exports live (see `lower.ts`).
+ * Modules behave as ES modules do:
+ *
+ *   - A module's record exists, marked `loading`, before its code runs. In a
+ *     cycle — `a` imports `b`, which imports `a` back — `b` gets `a`'s exports
+ *     table as it stands instead of loading `a` again, and `a`'s hoisted
+ *     functions are already on it.
+ *   - Reading an export the module has not initialized yet (`names`) is an
+ *     error, like reading a `let` before its declaration.
+ *   - Imports are read through the exporting module's table, so they are live;
+ *     so are re-exports (`links`) and `export *` (`stars`), which the table
+ *     looks up in the other module on every read.
  */
 import { readFileSync } from "node:fs"
 import { dirname, relative, resolve } from "node:path"
@@ -36,9 +46,9 @@ import {
     ParseError, LexError,
     type ModuleExports, type Program, type ScopeAnalysis, type LuautConfig, type TypeAnalysis,
 } from "luaut-parser"
-import { parse as parseLuau, print, type Statement as LuauStatement, type TableExpression } from "luau-parser"
+import { parse as parseLuau, print, type Statement as LuauStatement, type TableExpression, type TableField } from "luau-parser"
 import { resolveConfig, type ConfigInput } from "./config.js"
-import { lower } from "./lower.js"
+import { lower, type ModuleInfo } from "./lower.js"
 import * as luau from "./luau.js"
 import { Names } from "./names.js"
 
@@ -62,8 +72,9 @@ export interface BundleDiagnostic {
     readonly line: number
     readonly column: number
     /** `type` and `config` problems are reported without stopping the build;
-     *  `syntax` and `module` problems leave no bundle. */
-    readonly category: "syntax" | "module" | "type" | "config"
+     *  `syntax`, `scope` (such as assigning to an import) and `module`
+     *  problems leave no bundle. */
+    readonly category: "syntax" | "scope" | "module" | "type" | "config"
 }
 
 export interface BundleResult {
@@ -100,7 +111,11 @@ export function bundle(options: BundleOptions): BundleResult {
         if (sources.has(file)) continue
         const program = parseFile(file, diagnostics)
         if (!program) return { modules: [], diagnostics }
-        sources.set(file, { file, name: nameOf(file), program, scopes: analyzeScopes(program) })
+        const scopes = analyzeScopes(program)
+        for (const d of scopes.diagnostics) {
+            diagnostics.push({ file, message: d.message, line: d.node.line.start, column: d.node.column.start, category: "scope" })
+        }
+        sources.set(file, { file, name: nameOf(file), program, scopes })
         for (const specifier of importedSpecifiers(program)) {
             const target = resolveModulePath(file, specifier, config)
             if (target && !target.endsWith(".d.luaut")) queue.push(target)
@@ -116,7 +131,7 @@ export function bundle(options: BundleOptions): BundleResult {
     const names = Names.from(...[...sources.values()].map(s => s.program))
     const G = names.fresh("G")
     const requireExpression = luau.member(luau.identifier(G), "require")
-    const modules = new Map<string, { name: string; statements: LuauStatement[]; exportsName: string; exports: boolean }>()
+    const modules = new Map<string, { name: string; statements: LuauStatement[]; exportsName: string; info: ModuleInfo }>()
     const pending = [entry]
     while (pending.length) {
         const file = pending.shift()!
@@ -126,6 +141,7 @@ export function bundle(options: BundleOptions): BundleResult {
             names,
             types: analysis.types.get(file),
             module: {
+                name: source.name,
                 require: requireExpression,
                 resolve: specifier => {
                     const target = resolveModulePath(file, specifier, config)
@@ -140,7 +156,7 @@ export function bundle(options: BundleOptions): BundleResult {
             name: source.name,
             statements: lowered.statements,
             exportsName: lowered.exportsName,
-            exports: source.program.body.statements.some(isExport),
+            info: lowered.module,
         })
     }
 
@@ -151,7 +167,7 @@ export function bundle(options: BundleOptions): BundleResult {
     diagnostics.push(...reported)
 
     const moduleNames = [...modules.values()].map(m => m.name)
-    if (diagnostics.some(d => d.category === "syntax" || d.category === "module")) {
+    if (diagnostics.some(d => d.category === "syntax" || d.category === "scope" || d.category === "module")) {
         return { modules: moduleNames, diagnostics }
     }
 
@@ -162,15 +178,22 @@ export function bundle(options: BundleOptions): BundleResult {
         : undefined
     if (!modulesTable) throw new Error("luaut-build: the bundle runtime has no modules table")
     for (const module of modules.values()) {
-        modulesTable.fields.push({
-            type: "TableFieldComputed",
-            key: luau.string(module.name),
-            // Vararg, so a top-level `...` is still valid Luau.
-            value: luau.functionExpression(luau.functionBody([module.exportsName], module.statements, true)),
-        })
+        const { names: exported, links, stars } = module.info
+        const fields: TableField[] = []
+        if (exported.length) fields.push(luau.field("names", luau.table(exported.map(n => luau.field(n, luau.boolean(true))))))
+        if (links.length) {
+            fields.push(luau.field("links", luau.table(links.map(link => luau.field(link.name, luau.table([
+                { type: "TableFieldPositional", value: luau.string(link.module) },
+                ...(link.imported === undefined ? [] : [{ type: "TableFieldPositional" as const, value: luau.string(link.imported) }]),
+            ]))))))
+        }
+        if (stars.length) fields.push(luau.field("stars", luau.table(stars.map(star => ({ type: "TableFieldPositional", value: luau.string(star) })))))
+        // Vararg, so a top-level `...` is still valid Luau.
+        fields.push(luau.field("load", luau.functionExpression(luau.functionBody([module.exportsName], module.statements, true))))
+        modulesTable.fields.push({ type: "TableFieldComputed", key: luau.string(module.name), value: luau.table(fields) })
     }
     const start = luau.call(requireExpression, [luau.string(sources.get(entry)!.name)])
-    program.body.statements.push(modules.get(entry)!.exports ? luau.returns([start]) : luau.callStatement(start))
+    program.body.statements.push(modules.get(entry)!.info.exports ? luau.returns([start]) : luau.callStatement(start))
 
     return { code: print(program) + "\n", modules: moduleNames, diagnostics }
 }
@@ -184,13 +207,47 @@ ${G} = {
     records = {},
     require = function(name)
         local record = ${G}.records[name]
-        if record == nil then
-            record = { loading = true, exports = {} }
-            ${G}.records[name] = record
-            ${G}.modules[name](record.exports)
-            record.loading = false
+        if record ~= nil then
+            return record.exports
         end
-        return record.exports
+        local module = ${G}.modules[name]
+        local initialized = {}
+        local exports = setmetatable({}, {
+            __index = function(_, key)
+                if initialized[key] then
+                    return nil
+                end
+                if module.names ~= nil and module.names[key] then
+                    error(("Cannot access '%s' before initialization: '%s' has not reached it yet"):format(tostring(key), name), 2)
+                end
+                local link = module.links ~= nil and module.links[key]
+                if link then
+                    local source = ${G}.require(link[1])
+                    if link[2] == nil then
+                        return source
+                    end
+                    return source[link[2]]
+                end
+                if module.stars ~= nil and key ~= "default" then
+                    for _, star in module.stars do
+                        local value = ${G}.require(star)[key]
+                        if value ~= nil then
+                            return value
+                        end
+                    end
+                end
+                return nil
+            end,
+            __newindex = function(target, key, value)
+                initialized[key] = true
+                rawset(target, key, value)
+            end,
+        })
+        record = { loading = true, exports = exports }
+        ${G}.records[name] = record
+        module.load(exports)
+        record.loading = false
+        return exports
     end,
 }
 `
@@ -221,11 +278,6 @@ function importedSpecifiers(program: Program): string[] {
         s.type === "ImportStatement" || s.type === "ExportAllStatement" || (s.type === "ExportNamedStatement" && s.source)
             ? [(s as { source: { value: string } }).source.value]
             : [])
-}
-
-function isExport(statement: Program["body"]["statements"][number]): boolean {
-    return statement.type === "ExportStatement" || statement.type === "ExportDefaultStatement" ||
-        statement.type === "ExportNamedStatement" || statement.type === "ExportAllStatement"
 }
 
 /** Every module's types, and its type errors, against the config's type libraries. */

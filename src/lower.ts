@@ -38,6 +38,8 @@ import { Names } from "./names.js"
 
 /** What lowering a file as a module of a bundle needs. */
 export interface ModuleContext {
+    /** The bundle's name for this module. */
+    readonly name: string
     /** The bundle's name for the module `specifier` imports, or `undefined`
      *  when there is no such module (reported). */
     resolve(specifier: string): string | undefined
@@ -67,7 +69,24 @@ export interface LowerResult {
     readonly statements: L.Statement[]
     /** In a module: the parameter the statements fill in with the exports. */
     readonly exportsName: string
+    /** In a module: what the bundle's `require` needs to know about it. */
+    readonly module: ModuleInfo
     readonly diagnostics: LowerDiagnostic[]
+}
+
+/** How a module's exports behave at runtime, beyond what its code assigns. */
+export interface ModuleInfo {
+    /** Names the module itself exports. Reading one before the module has
+     *  initialized it is an error, as in ES modules. */
+    readonly names: string[]
+    /** Names re-exported from another module — `export { x as y } from` —
+     *  read from that module on every access, so they stay live.
+     *  `imported` is `undefined` for the whole module (`import * as M; export { M }`). */
+    readonly links: { name: string; module: string; imported?: string }[]
+    /** `export * from` modules, consulted live for any other name. */
+    readonly stars: string[]
+    /** Whether the module exports anything. */
+    exports: boolean
 }
 
 export function lower(program: T.Program, scopes: ScopeAnalysis, options: LowerOptions = {}): LowerResult {
@@ -116,6 +135,7 @@ class Lowerer {
         return {
             statements: [...captured, ...helpers, ...body],
             exportsName: this.exportsName,
+            module: this.info,
             diagnostics: this.diagnostics,
         }
     }
@@ -212,27 +232,32 @@ class Lowerer {
     // Modules
     // --------------------------------------------------------
 
+    private readonly info: ModuleInfo = { names: [], links: [], stars: [], exports: false }
+
     /** The module body, in the order an ES module runs:
      *
      *    local a, b, util          -- every top-level name, declared first
-     *    exports.f = function ...  -- every top-level function, hoisted
+     *    function exports.f() ...  -- every top-level function, hoisted
      *    util = require("util")    -- the imports
      *    ...                       -- the rest, in source order */
     private module(context: ModuleContext): L.Statement[] {
         const statements = this.source.body.statements
         const exportsTable = (): L.Identifier => luau.identifier(this.exportsName)
+        const { names, links, stars } = this.info
         const locals: string[] = []
         const requires: L.Statement[] = []
         /** Required modules, one local each however many statements import them. */
         const moduleLocals = new Map<string, string>()
+        /** Where each imported binding comes from, for re-exporting it live. */
+        const importedFrom = new Map<BindingId, { module: string; imported?: string }>()
 
-        const requireModule = (source: T.StringLiteral, used: boolean): string | undefined => {
-            if (!used) return undefined
+        const resolve = (source: T.StringLiteral): string | undefined => {
             const key = context.resolve(source.value)
-            if (key === undefined) {
-                this.report(source, `Cannot find module '${source.value}'`)
-                return undefined
-            }
+            if (key === undefined) this.report(source, `Cannot find module '${source.value}'`)
+            return key
+        }
+        /** A local holding the module's exports, required where imports run. */
+        const moduleLocal = (key: string): string => {
             let local = moduleLocals.get(key)
             if (!local) {
                 local = this.names.fresh(moduleName(key))
@@ -242,34 +267,46 @@ class Lowerer {
             }
             return local
         }
+        /** Loaded for its place in the order only: its exports are linked, not read here. */
+        const load = (key: string): void => {
+            if (!moduleLocals.has(key)) requires.push(luau.callStatement(luau.call(context.require, [luau.string(key)])))
+        }
 
-        const exportBinding = (node: object | undefined, exported: string): boolean => {
+        const exportBinding = (node: object | undefined, exported: string): void => {
             const binding = node && this.bindingByDeclaration.get(node)
-            if (!binding) return false
-            if (!this.rewrites.has(binding.id)) {
-                this.rewrites.set(binding.id, () => luau.member(exportsTable(), exported))
-                return true
+            if (!binding) return
+            const existing = this.rewrites.get(binding.id)
+            if (existing) {
+                // Exported again under another name: the same value, read live.
+                const first = memberChain(existing())
+                links.push({ name: exported, module: context.name, imported: first?.[first.length - 1] })
+                return
             }
-            // Exported again under another name: copy it across once loaded.
-            const current = this.rewrites.get(binding.id)!
-            this.trailing.push(luau.assign([luau.member(exportsTable(), exported)], [current()]))
-            return true
+            names.push(exported)
+            this.rewrites.set(binding.id, () => luau.member(exportsTable(), exported))
         }
 
         // Imports first: an export may name an imported binding.
         for (const statement of statements) {
             if (statement.type !== "ImportStatement") continue
             const specifiers = [
-                ...(statement.defaultImport ? [{ local: statement.defaultImport, imported: "default" }] : []),
-                ...statement.specifiers.map(s => ({ local: s.local, imported: s.imported.name })),
+                ...(statement.defaultImport ? [{ local: statement.defaultImport, imported: "default" as string | undefined }] : []),
+                ...(statement.namespaceImport ? [{ local: statement.namespaceImport, imported: undefined }] : []),
+                ...statement.specifiers.map(s => ({ local: s.local, imported: s.imported.name as string | undefined })),
             ]
             // A binding read nowhere — say, a type — needs no module.
             const used = specifiers.filter(s => (this.bindingByDeclaration.get(s.local)?.references.length ?? 0) > 0)
-            const local = requireModule(statement.source, used.length > 0)
-            if (!local) continue
+            if (!used.length) continue
+            const key = resolve(statement.source)
+            if (key === undefined) continue
+            const local = moduleLocal(key)
             for (const s of used) {
                 const binding = this.bindingByDeclaration.get(s.local)!
-                this.rewrites.set(binding.id, () => luau.member(luau.identifier(local), s.imported))
+                importedFrom.set(binding.id, { module: key, imported: s.imported })
+                const imported = s.imported
+                this.rewrites.set(binding.id, imported === undefined
+                    ? () => luau.identifier(local)
+                    : () => luau.member(luau.identifier(local), imported))
             }
         }
 
@@ -282,42 +319,37 @@ class Lowerer {
                     else for (const pattern of declaration.names.flatMap(identifierPatterns)) exportBinding(pattern, pattern.name)
                     break
                 }
+                case "ExportDefaultStatement":
+                    names.push("default")
+                    break
                 case "ExportNamedStatement": {
                     if (statement.source) {
-                        const local = requireModule(statement.source, true)
-                        for (const s of statement.specifiers) {
-                            if (local) requires.push(luau.assign([luau.member(exportsTable(), s.exported.name)], [luau.member(luau.identifier(local), s.local.name)]))
-                        }
+                        const key = resolve(statement.source)
+                        if (key === undefined) break
+                        load(key)
+                        for (const s of statement.specifiers) links.push({ name: s.exported.name, module: key, imported: s.local.name })
                         break
                     }
                     for (const s of statement.specifiers) {
                         const declaration = topLevelDeclaration(statements, s.local.name)
-                        const importedAs = declaration?.type === "ImportStatement" ? this.bindingByDeclaration.get(declaration.node) : undefined
-                        if (importedAs) {
-                            // Re-exporting an import: its value once this module has loaded it.
-                            const read = this.rewrites.get(importedAs.id)
-                            if (read) requires.push(luau.assign([luau.member(exportsTable(), s.exported.name)], [read()]))
-                        } else if (declaration) {
-                            exportBinding(declaration.node, s.exported.name)
-                        }
+                        const binding = declaration && this.bindingByDeclaration.get(declaration.node)
+                        const from = binding && importedFrom.get(binding.id)
+                        if (from) links.push({ name: s.exported.name, ...from })
+                        else if (declaration?.type === "Declaration") exportBinding(declaration.node, s.exported.name)
                         // Otherwise it names a type: nothing exists at runtime.
                     }
                     break
                 }
                 case "ExportAllStatement": {
-                    const local = requireModule(statement.source, true)
-                    if (!local) break
-                    // Every name but `default`; the module's own exports are
-                    // assigned later and take precedence.
-                    requires.push(luau.genericFor(["key", "value"], [luau.call(this.builtin("pairs"), [luau.identifier(local)])], [
-                        luau.ifThen(luau.binary("~=", luau.identifier("key"), luau.string("default")), [
-                            luau.assign([luau.index(exportsTable(), luau.identifier("key"))], [luau.identifier("value")]),
-                        ]),
-                    ]))
+                    const key = resolve(statement.source)
+                    if (key === undefined) break
+                    load(key)
+                    stars.push(key)
                     break
                 }
             }
         }
+        this.info.exports = names.length > 0 || links.length > 0 || stars.length > 0
 
         // Every other top-level name is a local of the module function,
         // declared up front so hoisted functions can see it.
@@ -365,11 +397,8 @@ class Lowerer {
 
         const declarations: L.Statement[] = []
         for (let i = 0; i < locals.length; i += 100) declarations.push(luau.local(locals.slice(i, i + 100), []))
-        return [...declarations, ...hoisted, ...requires, ...body, ...this.trailing]
+        return [...declarations, ...hoisted, ...requires, ...body]
     }
-
-    /** Statements that must run once the module body has. */
-    private readonly trailing: L.Statement[] = []
 
     /** Is `expression` a table iterated directly — not an iterator function
      *  such as `pairs(t)` or `string.gmatch(s, p)`? Known from its type. */
@@ -561,7 +590,11 @@ class Lowerer {
     /** `const a, { b } = x, y`. In "assign" mode — a module's top level, where
      *  every name is declared up front — nothing is declared, only assigned. */
     private variableDeclaration(node: T.VariableDeclaration, mode: Mode): L.Statement[] {
-        if (mode === "assign" && !node.init.length) return []
+        if (mode === "assign" && !node.init.length) {
+            // `export let x`: the export exists from here on, holding nil.
+            const exported = node.names.flatMap(identifierPatterns).filter(p => this.isRewritten(p))
+            return exported.length ? [luau.assign(exported.map(p => this.reference(p)), exported.map(() => luau.nil()))] : []
+        }
         const init = node.init.map(e => this.expression(e))
         if (node.names.every(n => n.type === "IdentifierPattern")) {
             const names = node.names as T.IdentifierPattern[]
