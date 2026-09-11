@@ -31,7 +31,7 @@
  *     functions.
  */
 import type * as T from "luaut-parser"
-import type { Binding, BindingId, ScopeAnalysis } from "luaut-parser"
+import type { Binding, BindingId, ScopeAnalysis, Type, TypeAnalysis } from "luaut-parser"
 import type * as L from "luau-parser"
 import * as luau from "./luau.js"
 import { Names } from "./names.js"
@@ -52,6 +52,9 @@ export interface LowerOptions {
     readonly module?: ModuleContext
     /** Names already taken beyond the file's own — a bundle's. */
     readonly names?: Names
+    /** The file's types. They decide what `for x in t` means: over a table
+     *  it yields the values, which in Luau needs a key variable before `x`. */
+    readonly types?: TypeAnalysis
 }
 
 export interface LowerDiagnostic {
@@ -88,6 +91,8 @@ class Lowerer {
      *  an import through its module's table. */
     private readonly rewrites = new Map<BindingId, () => L.Expression>()
     private readonly exportsName: string
+    /** Globals generated code calls, renamed where the source shadows them. */
+    private readonly builtins = new Map<string, string>()
 
     constructor(
         private readonly source: T.Program,
@@ -105,8 +110,11 @@ class Lowerer {
         const body = this.options.module
             ? this.module(this.options.module)
             : this.source.body.statements.flatMap(s => this.statement(s))
+        const helpers = this.helperDefinitions()
+        // Captured before any of the file's code runs — before its own `table`.
+        const captured = [...this.builtins].map(([global, local]) => luau.local([local], [luau.identifier(global)]))
         return {
-            statements: [...this.helperDefinitions(), ...body],
+            statements: [...captured, ...helpers, ...body],
             exportsName: this.exportsName,
             diagnostics: this.diagnostics,
         }
@@ -142,6 +150,19 @@ class Lowerer {
         return rewrite ? rewrite() : luau.identifier(this.name(node.name))
     }
 
+    /** A global the generated code calls — `pairs`, `table`, ... — under a name
+     *  the source cannot have shadowed. */
+    private builtin(global: string): L.Identifier {
+        let local = this.builtins.get(global)
+        if (!local) {
+            const shadowed = [...this.scopes.bindings.values()].some(b => b.name === global && b.kind !== "global")
+            if (!shadowed) return luau.identifier(global)
+            local = this.names.fresh(`luaut_${global}`)
+            this.builtins.set(global, local)
+        }
+        return luau.identifier(local)
+    }
+
     private helper(kind: Helper): L.Identifier {
         let name = this.helpers.get(kind)
         if (!name) {
@@ -157,10 +178,10 @@ class Lowerer {
         if (assign) {
             // assign(target, ...sources): copy each source's keys into target, in order.
             out.push(luau.localFunction(assign, luau.functionBody(["target"], [
-                luau.numericFor("i", luau.number(1), selectCount(), [
-                    luau.local(["source"], [luau.call(luau.identifier("select"), [luau.identifier("i"), vararg()])]),
+                luau.numericFor("i", luau.number(1), selectCount(this.builtin("select")), [
+                    luau.local(["source"], [luau.call(this.builtin("select"), [luau.identifier("i"), vararg()])]),
                     luau.ifThen(luau.binary("~=", luau.identifier("source"), luau.nil()), [
-                        luau.genericFor(["key", "value"], [luau.call(luau.identifier("pairs"), [luau.identifier("source")])], [
+                        luau.genericFor(["key", "value"], [luau.call(this.builtin("pairs"), [luau.identifier("source")])], [
                             luau.assign([luau.index(luau.identifier("target"), luau.identifier("key"))], [luau.identifier("value")]),
                         ]),
                     ]),
@@ -173,9 +194,9 @@ class Lowerer {
             // concat(...parts): one array holding every part's elements, in order.
             out.push(luau.localFunction(concat, luau.functionBody([], [
                 luau.local(["result"], [luau.table([])]),
-                luau.numericFor("i", luau.number(1), selectCount(), [
-                    luau.local(["part"], [luau.call(luau.identifier("select"), [luau.identifier("i"), vararg()])]),
-                    luau.callStatement(luau.call(luau.member(luau.identifier("table"), "move"), [
+                luau.numericFor("i", luau.number(1), selectCount(this.builtin("select")), [
+                    luau.local(["part"], [luau.call(this.builtin("select"), [luau.identifier("i"), vararg()])]),
+                    luau.callStatement(luau.call(luau.member(this.builtin("table"), "move"), [
                         luau.identifier("part"), luau.number(1), luau.unary("#", luau.identifier("part")),
                         luau.binary("+", luau.unary("#", luau.identifier("result")), luau.number(1)),
                         luau.identifier("result"),
@@ -288,7 +309,7 @@ class Lowerer {
                     if (!local) break
                     // Every name but `default`; the module's own exports are
                     // assigned later and take precedence.
-                    requires.push(luau.genericFor(["key", "value"], [luau.call(luau.identifier("pairs"), [luau.identifier(local)])], [
+                    requires.push(luau.genericFor(["key", "value"], [luau.call(this.builtin("pairs"), [luau.identifier(local)])], [
                         luau.ifThen(luau.binary("~=", luau.identifier("key"), luau.string("default")), [
                             luau.assign([luau.index(exportsTable(), luau.identifier("key"))], [luau.identifier("value")]),
                         ]),
@@ -316,7 +337,9 @@ class Lowerer {
         for (const statement of statements) {
             const declaration = statement.type === "ExportStatement" ? statement.declaration : statement
             if (declaration.type === "FunctionDeclaration") {
-                hoisted.push(luau.assign([this.reference(declaration.name)], [luau.functionExpression(this.functionBody(declaration.func))]))
+                // `function exports.f()` / `function f()`: assigns the export, or
+                // the local declared above, and keeps attributes such as `@native`.
+                hoisted.push(this.functionStatement(this.reference(declaration.name), declaration, declaration.func, false))
                 continue
             }
             switch (declaration.type) {
@@ -348,6 +371,37 @@ class Lowerer {
     /** Statements that must run once the module body has. */
     private readonly trailing: L.Statement[] = []
 
+    /** Is `expression` a table iterated directly — not an iterator function
+     *  such as `pairs(t)` or `string.gmatch(s, p)`? Known from its type. */
+    private iteratesTable(expression: T.Expression): boolean {
+        const types = this.options.types
+        const type = types?.typeOf.get(expression)
+        if (!types || !type) return false
+        const seen = new Set<Type>()
+        const table = (t: Type): boolean => {
+            if (seen.has(t)) return false
+            seen.add(t)
+            switch (t.kind) {
+                case "array":
+                case "tuple":
+                    return true
+                case "object":
+                    return !t.class
+                case "union":
+                    return t.types.every(m => (m.kind === "primitive" && m.name === "nil") || table(m))
+                case "intersection":
+                    return t.types.some(table)
+                case "genericRef": {
+                    const alias = types.aliases.get(t.name)
+                    return alias !== undefined && table(alias)
+                }
+                default:
+                    return false
+            }
+        }
+        return table(type)
+    }
+
     private isRewritten(node: object): boolean {
         const binding = this.bindingByDeclaration.get(node)
         return binding !== undefined && this.rewrites.has(binding.id)
@@ -375,7 +429,7 @@ class Lowerer {
                 return this.variableDeclaration(node, "declare")
 
             case "FunctionDeclaration":
-                return [luau.localFunction(this.name(node.name.name), this.functionBody(node.func))]
+                return [{ ...luau.localFunction(this.name(node.name.name), this.functionBody(node.func)), attributes: node.attributes }]
 
             case "FunctionDeclarationStatement":
                 return [this.functionDeclarationStatement(node)]
@@ -441,6 +495,11 @@ class Lowerer {
                     prelude.push(...this.destructure(target, luau.identifier(temp), "declare"))
                     return temp
                 })
+                // `for x in list` yields the values in luaut, as its types say;
+                // Luau yields the keys first.
+                if (variables.length === 1 && node.iterators.length === 1 && this.iteratesTable(node.iterators[0])) {
+                    variables.unshift(this.names.fresh("_"))
+                }
                 return [luau.genericFor(variables, node.iterators.map(e => this.expression(e)), this.block(node.body, prelude).statements)]
             }
 
@@ -468,21 +527,33 @@ class Lowerer {
     private functionDeclarationStatement(node: T.FunctionDeclarationStatement): L.FunctionDeclarationStatement {
         // `function util.helper()` where `util` is rewritten to `exports.util`:
         // the base becomes `exports`, and the rest of the path follows.
-        const base = this.reference(node.target.base)
-        const chain = memberChain(base)
-        if (!chain) this.report(node.target.base, "This function name cannot be written in Luau")
-        const [root, ...prefix] = chain ?? [this.name(node.target.base.name)]
+        const statement = this.functionStatement(this.reference(node.target.base), node, node.func, node.isMethod, node.target.path.map(p => p.name))
+        if (!node.target.method) return statement
+        return { ...statement, target: { ...statement.target, method: luau.identifier(node.target.method.name) } }
+    }
+
+    /** `function a.b.c()`, for a target written as an expression. */
+    private functionStatement(
+        target: L.Expression,
+        node: T.BaseNode & { attributes?: string[] },
+        func: T.FunctionBody,
+        isMethod: boolean,
+        path: string[] = [],
+    ): L.FunctionDeclarationStatement {
+        const chain = memberChain(target)
+        if (!chain) this.report(node, "This function name cannot be written in Luau")
+        const [root, ...prefix] = chain ?? ["_"]
         return {
             type: "FunctionDeclarationStatement",
             target: {
                 type: "FunctionName",
                 base: luau.identifier(root),
-                path: [...prefix, ...node.target.path.map(p => p.name)].map(luau.identifier),
-                method: node.target.method && luau.identifier(node.target.method.name),
-                ...spanOf(node.target),
+                path: [...prefix, ...path].map(luau.identifier),
+                ...spanOf(node),
             },
-            isMethod: node.isMethod,
-            func: this.functionBody(node.func),
+            isMethod,
+            func: this.functionBody(func),
+            attributes: node.attributes,
             ...spanOf(node),
         }
     }
@@ -608,7 +679,7 @@ class Lowerer {
                     return condition ? luau.binary("and", condition, differs) : differs
                 }, undefined)
                 const copy = luau.assign([luau.index(rest.target, luau.identifier(key))], [luau.identifier(value)])
-                after.push(luau.genericFor([key, value], [luau.call(luau.identifier("pairs"), [source])], kept ? [luau.ifThen(kept, [copy])] : [copy]))
+                after.push(luau.genericFor([key, value], [luau.call(this.builtin("pairs"), [source])], kept ? [luau.ifThen(kept, [copy])] : [copy]))
                 after.push(...rest.then)
             }
         } else {
@@ -617,7 +688,7 @@ class Lowerer {
             })
             if (pattern.rest) {
                 // `...rest`: a new array of the elements after the named ones.
-                const elements = luau.call(luau.member(luau.identifier("table"), "move"), [
+                const elements = luau.call(luau.member(this.builtin("table"), "move"), [
                     source, luau.number(pattern.elements.length + 1), luau.unary("#", source), luau.number(1), luau.table([]),
                 ])
                 const rest = this.restTarget(pattern.rest, elements, mode, after)
@@ -756,7 +827,7 @@ class Lowerer {
                 text += part.value
             } else {
                 format += "%s"
-                args.push(luau.call(luau.identifier("tostring"), [this.expression(part.expression)]))
+                args.push(luau.call(this.builtin("tostring"), [this.expression(part.expression)]))
             }
         }
         if (!args.length) return luau.string(text)
@@ -838,8 +909,8 @@ function vararg(): L.VarargExpression {
 }
 
 /** `select("#", ...)` */
-function selectCount(): L.Expression {
-    return luau.call(luau.identifier("select"), [luau.string("#"), vararg()])
+function selectCount(select: L.Expression): L.Expression {
+    return luau.call(select, [luau.string("#"), vararg()])
 }
 
 function expandsToMany(e: L.Expression): boolean {

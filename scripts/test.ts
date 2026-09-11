@@ -114,6 +114,14 @@ lowers("if expressions", "const v = if a then 1 elseif b then 2 else 3", "local 
 lowers("a Luau keyword used as a name", "let local = 1\nprint(t.local, local)", `local local_ = 1; print(t["local"], local_);`)
 lowers("generated names avoid the source's", "const ref = 1\nconst { a } = f()", "local ref = 1; local ref2 = f(); local a = ref2.a;")
 
+lowers("for x in a table yields the values", "const list = [1, 2]\nfor v in list do print(v) end",
+    "local list = { 1, 2 }; for _, v in list do print(v); end;")
+lowers("an iterator function keeps its own values", "for k in pairs(t) do print(k) end", "for k in pairs(t) do print(k); end;")
+lowers("attributes are kept", "@native\nconst function f(x: number): number\n    return x\nend", "@native local function f(x) return x; end;")
+lowers("a shadowed global the output needs is captured first",
+    "const table = {}\nconst [a, ...rest] = list\nprint(`${a}`)",
+    `local luaut_table = table; local table = {}; local a = list[1]; local rest = luaut_table.move(list, 2, #list, 1, {}); print(("%s"):format(tostring(a)));`)
+
 check("a parse error leaves no output",
     ((r) => [r.code, r.diagnostics.length > 0])(compile("const = 1")), [undefined, true])
 check("reassigning a const is an error",
@@ -238,6 +246,50 @@ function runs(name: string, result: BundleResult, expected: string[]): void {
     check("bundle: type errors are reported and the bundle is still written",
         [result.code !== undefined, result.diagnostics.filter(d => d.category === "type").map(d => d.message)],
         [true, [`Type '"text"' is not assignable to 'number'`]])
+}
+
+{
+    // Most of the language in one program, checked by what it prints.
+    const root = project({
+        "main.luaut": [
+            `import { Stack } from "./stack"`,
+            `type Point = { x: number, y: number }`,
+            `const table = { note: "shadows the global" }`,
+            `const point: Point = { x: 1, y: 2 }`,
+            `const { x, y: py = 9, ...others } = { ...point, z: 3, w: 4 }`,
+            `let count = 0`,
+            `for key in pairs(others) do count += 1 end`,
+            `const [first, , third = "three", ...tail] = ["one", "two", nil, "four", "five"]`,
+            `const function sum({ a, b = 10 }: { a: number, b?: number }, scale = 1): number`,
+            `    return (a + b) * scale`,
+            `end`,
+            `const values = [0, ...[1, 2], sum({ a: 1 }), sum({ a: 1, b: 1 }, 2)]`,
+            `let total = 0`,
+            `for v in values do total += v end`,
+            `const stack = Stack.new()`,
+            `stack:push(5)`,
+            `const label = if total > 10 then "big" else "small"`,
+            `let a, b = 1, 2`,
+            `{ a, b } = { a: b, b: a }`,
+            `print(\`\${x} \${py} \${count} \${first} \${third} \${#tail} \${total} \${label} \${stack:size()} \${a}\${b} 100%\`, table.note, ...)`,
+        ].join("\n"),
+        "stack.luaut": [
+            `export const Stack = {}`,
+            `Stack.__index = Stack`,
+            `function Stack.new()`,
+            `    return setmetatable({ items: [] }, Stack)`,
+            `end`,
+            `function Stack:push(value: number)`,
+            `    table.insert(self.items, value)`,
+            `end`,
+            `function Stack:size(): number`,
+            `    return #self.items`,
+            `end`,
+        ].join("\n"),
+    })
+    runs("bundle: the language at runtime",
+        bundle({ entry: join(root, "main.luaut"), config: { types: [] } }),
+        ["1 2 2 one three 2 18 big 1 21 100%\tshadows the global"])
 }
 
 {

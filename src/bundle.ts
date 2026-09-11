@@ -34,7 +34,7 @@ import { dirname, relative, resolve } from "node:path"
 import {
     parse, analyzeScopes, analyzeTypes, moduleExports, resolveModulePath, resolveTypeLibraries,
     ParseError, LexError,
-    type ModuleExports, type Program, type ScopeAnalysis, type LuautConfig,
+    type ModuleExports, type Program, type ScopeAnalysis, type LuautConfig, type TypeAnalysis,
 } from "luaut-parser"
 import { parse as parseLuau, print, type Statement as LuauStatement, type TableExpression } from "luau-parser"
 import { resolveConfig, type ConfigInput } from "./config.js"
@@ -107,7 +107,9 @@ export function bundle(options: BundleOptions): BundleResult {
         }
     }
 
-    if (options.typeCheck !== false) diagnostics.push(...typeCheck([...sources.values()], config))
+    // Types are needed either way: lowering reads them (`for x in list`).
+    const analysis = analyzeModules([...sources.values()], config)
+    if (options.typeCheck !== false) diagnostics.push(...analysis.diagnostics)
 
     // Lower each module the entry needs at runtime: an import only of types
     // requires nothing, and brings no module in.
@@ -122,6 +124,7 @@ export function bundle(options: BundleOptions): BundleResult {
         const source = sources.get(file)!
         const lowered = lower(source.program, source.scopes, {
             names,
+            types: analysis.types.get(file),
             module: {
                 require: requireExpression,
                 resolve: specifier => {
@@ -162,7 +165,8 @@ export function bundle(options: BundleOptions): BundleResult {
         modulesTable.fields.push({
             type: "TableFieldComputed",
             key: luau.string(module.name),
-            value: luau.functionExpression(luau.functionBody([module.exportsName], module.statements)),
+            // Vararg, so a top-level `...` is still valid Luau.
+            value: luau.functionExpression(luau.functionBody([module.exportsName], module.statements, true)),
         })
     }
     const start = luau.call(requireExpression, [luau.string(sources.get(entry)!.name)])
@@ -224,9 +228,13 @@ function isExport(statement: Program["body"]["statements"][number]): boolean {
         statement.type === "ExportNamedStatement" || statement.type === "ExportAllStatement"
 }
 
-/** Type errors in every module, against the config's type libraries. */
-function typeCheck(modules: SourceModule[], config: LuautConfig | undefined): BundleDiagnostic[] {
+/** Every module's types, and its type errors, against the config's type libraries. */
+function analyzeModules(
+    modules: SourceModule[],
+    config: LuautConfig | undefined,
+): { types: Map<string, TypeAnalysis>; diagnostics: BundleDiagnostic[] } {
     const out: BundleDiagnostic[] = []
+    const analyses = new Map<string, TypeAnalysis>()
     const libraries = config ? resolveTypeLibraries(config) : { files: [], problems: [] }
     for (const p of libraries.problems) out.push({ file: p.file, message: p.message, line: p.line ?? 1, column: p.column ?? 1, category: "config" })
     const libs = libraries.files.map(file => parse(readFileSync(file, "utf8")))
@@ -264,10 +272,11 @@ function typeCheck(modules: SourceModule[], config: LuautConfig | undefined): Bu
     for (const module of modules) {
         const scopes = analyzeScopes(module.program, { builtinGlobals: globals })
         const types = analyzeTypes(module.program, scopes, { libs, resolveModule: resolverFor(module.file) })
+        analyses.set(module.file, types)
         for (const d of types.diagnostics) {
             const at = d.node as { line: { start: number }; column: { start: number } }
             out.push({ file: module.file, message: d.message, line: at.line.start, column: at.column.start, category: "type" })
         }
     }
-    return out
+    return { types: analyses, diagnostics: out }
 }

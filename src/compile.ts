@@ -2,7 +2,7 @@
  * One luaut file -> Luau, on its own: no imports, no exports. A project goes
  * through `bundle` instead.
  */
-import { parse, analyzeScopes, ParseError, LexError } from "luaut-parser"
+import { parse, analyzeScopes, analyzeTypes, ParseError, LexError } from "luaut-parser"
 import { print } from "luau-parser"
 import { lower } from "./lower.js"
 import * as luau from "./luau.js"
@@ -37,7 +37,7 @@ export function compile(source: string): CompileResult {
         message: d.message, line: d.node.line.start, column: d.node.column.start,
     }))
 
-    const lowered = lower(program, scopes)
+    const lowered = lower(program, scopes, { types: analyzeTypes(program, scopes, { diagnostics: false }) })
     diagnostics.push(...lowered.diagnostics)
     if (diagnostics.length) return { diagnostics }
     return { code: print(luau.program(lowered.statements)) + "\n", diagnostics }
