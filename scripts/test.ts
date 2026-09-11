@@ -475,6 +475,37 @@ function fails(name: string, result: BundleResult, message: string): void {
     check("bundle: nocheck builds a file with scope errors", [quiet.diagnostics, quiet.code !== undefined], [[], true])
 }
 
+{
+    const source = [
+        `let Resource: ReturnType<typeof Load> | nil`,
+        `const early = parity(4)`,
+        `function Load()`,
+        `    return { level: Config.level, even: parity(4) }`,
+        `end`,
+        `function parity(n: number): string`,
+        `    function isEven(k: number): boolean`,
+        `        if k == 0 then return true end`,
+        `        return isOdd(k - 1)`,
+        `    end`,
+        `    function isOdd(k: number): boolean`,
+        `        if k == 0 then return false end`,
+        `        return isEven(k - 1)`,
+        `    end`,
+        `    return if isEven(n) then "even" else "odd"`,
+        `end`,
+        `const Config = { level: 3 }`,
+        `Resource = Load()`,
+        `print(early, Resource.level, Resource.even, parity(3))`,
+    ].join("\n")
+    const root = project({ "main.luaut": source })
+    runs("bundle: functions are hoisted, and see the module's later names",
+        bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["even\t3\teven\todd"])
+    // Outside a bundle: the same, as one file.
+    const single = compile(source)
+    check("compile: a function used above its declaration is hoisted whole", single.diagnostics.map(d => d.message), [])
+    if (single.code !== undefined) runs("compile: hoisted functions run", { code: single.code, diagnostics: [], modules: [] } as unknown as BundleResult, ["even\t3\teven\todd"])
+}
+
 function findLuau(): string | undefined {
     const candidates = [process.env.LUAU, "luau"].filter((c): c is string => !!c)
     const empty = join(mkdtempSync(join(tmpdir(), "luaut-probe-")), "empty.luau")

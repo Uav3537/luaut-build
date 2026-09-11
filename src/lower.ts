@@ -128,7 +128,7 @@ class Lowerer {
     run(): LowerResult {
         const body = this.options.module
             ? this.module(this.options.module)
-            : this.source.body.statements.flatMap(s => this.statement(s))
+            : this.topLevel(this.source.body.statements)
         const helpers = this.helperDefinitions()
         // Captured before any of the file's code runs — before its own `table`.
         const captured = [...this.builtins].map(([global, local]) => luau.local([local], [luau.identifier(global)]))
@@ -443,7 +443,70 @@ class Lowerer {
     // --------------------------------------------------------
 
     private block(block: T.Block, prelude: L.Statement[] = []): L.Block {
-        return luau.block([...prelude, ...block.statements.flatMap(s => this.statement(s))])
+        return luau.block([...prelude, ...this.blockStatements(block.statements)])
+    }
+
+    // --------------------------------------------------------
+    // Hoisting
+    // --------------------------------------------------------
+    //
+    // A function declaration is visible to its whole block. Luau's
+    // `local function f` is not, so a function something above it refers to is
+    // declared as a local at the top of the block and assigned where it is
+    // written: another function's body can call it once the block has run
+    // that far. (Calling it straight away, above its declaration, is an error
+    // scope analysis reports.) A bundle's module and a file's top level hoist
+    // the whole function instead.
+
+    /** Function declarations in `statements` that are referred to above
+     *  themselves. */
+    private referencedAhead(statements: readonly T.Statement[]): Set<T.FunctionDeclaration> {
+        const out = new Set<T.FunctionDeclaration>()
+        for (const statement of statements) {
+            if (statement.type !== "FunctionDeclaration") continue
+            const binding = this.bindingByDeclaration.get(statement.name)
+            const at = statement.name
+            if (binding?.references.some(r => r.line.start < at.line.start || (r.line.start === at.line.start && r.column.start < at.column.start))) {
+                out.add(statement)
+            }
+        }
+        return out
+    }
+
+    private blockStatements(statements: readonly T.Statement[]): L.Statement[] {
+        const ahead = this.referencedAhead(statements)
+        if (!ahead.size) return statements.flatMap(s => this.statement(s))
+        const names = [...ahead].map(f => this.name(f.name.name))
+        return [
+            luau.local(names, []),
+            ...statements.flatMap(s => (s.type === "FunctionDeclaration" && ahead.has(s)
+                ? [this.functionStatement(this.reference(s.name), s, s.func, false)]
+                : this.statement(s))),
+        ]
+    }
+
+    /** A file's statements outside a bundle. A function used above its
+     *  declaration is hoisted whole, as in a module: every top-level name is
+     *  declared first, then the functions are defined, then the rest runs. */
+    private topLevel(statements: readonly T.Statement[]): L.Statement[] {
+        if (!this.referencedAhead(statements).size) return statements.flatMap(s => this.statement(s))
+        const locals: string[] = []
+        const hoisted: L.Statement[] = []
+        const body: L.Statement[] = []
+        for (const statement of statements) {
+            if (statement.type === "VariableDeclaration") {
+                for (const pattern of statement.names.flatMap(identifierPatterns)) locals.push(this.name(pattern.name))
+                body.push(...this.variableDeclaration(statement, "assign"))
+            } else if (statement.type === "FunctionDeclaration") {
+                locals.push(this.name(statement.name.name))
+                hoisted.push(this.functionStatement(this.reference(statement.name), statement, statement.func, false))
+            } else {
+                body.push(...this.statement(statement))
+            }
+        }
+        const declarations: L.Statement[] = []
+        for (let i = 0; i < locals.length; i += 100) declarations.push(luau.local(locals.slice(i, i + 100), []))
+        return [...declarations, ...hoisted, ...body]
     }
 
     private statement(node: T.Statement): L.Statement[] {
