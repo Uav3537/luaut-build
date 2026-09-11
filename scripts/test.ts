@@ -397,6 +397,57 @@ function fails(name: string, result: BundleResult, message: string): void {
         bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["1"])
 }
 
+{
+    const root = project({
+        "main.luaut": [
+            `type Node = { name: string, child: Node | nil, greet: (self: Node, suffix: string) -> string, pair: () -> (number, number) }`,
+            `let reads = 0`,
+            `let argued = 0`,
+            `function arg(): string`,
+            `    argued += 1`,
+            `    return "!"`,
+            `end`,
+            `function make(name: string, child: Node | nil): Node`,
+            `    return { name, child, greet: function(self: Node, suffix: string): string return self.name .. suffix end, pair: function(): (number, number) return 1, 2 end }`,
+            `end`,
+            `const leaf = make("leaf", nil)`,
+            `const root = make("root", leaf)`,
+            `const none: Node | nil = nil`,
+            `function get(n: Node | nil): Node | nil`,
+            `    reads += 1`,
+            `    return n`,
+            `end`,
+            `print(root?.name, none?.name, root?.child?.name, leaf?.child?.name)`,
+            `print(root?:greet(arg()), none?:greet(arg()), argued)`,
+            `print(get(root)?.child?.name, get(none)?.child?.name, reads)`,
+            `print(root?.child:greet("?"), (none?.child) == nil)`,
+            `print(root?.pair())`,
+            `none?:greet(arg())`,
+            `root?.child?:greet(arg())`,
+            `get(root)?.child?:greet(arg())`,
+            `print(argued, reads)`,
+            `function spread(...: Node | nil): string | nil`,
+            `    return (...)?.child?.name`,
+            `end`,
+            `print(spread(root), spread(nil))`,
+        ].join("\n"),
+    })
+    runs("bundle: optional chains",
+        bundle({ entry: join(root, "main.luaut"), config: { types: [] } }),
+        [
+            "root\tnil\tleaf\tnil",
+            "root!\tnil\t1",
+            "leaf\tnil\t2",
+            "leaf?\ttrue",
+            "1\t2",
+            "3\t3",
+            "leaf\tnil",
+        ])
+    const code = bundle({ entry: join(root, "main.luaut"), config: { types: [] } }).code ?? ""
+    check("bundle: an optional read on a name is an `if` expression",
+        code.includes("if root == nil then nil else root.name"), true)
+}
+
 function findLuau(): string | undefined {
     const candidates = [process.env.LUAU, "luau"].filter((c): c is string => !!c)
     const empty = join(mkdtempSync(join(tmpdir(), "luaut-probe-")), "empty.luau")

@@ -478,6 +478,8 @@ class Lowerer {
                 }]
 
             case "CallStatement": {
+                const chain = optionalChain(node.expression)
+                if (chain) return [this.optionalCallStatement(chain)]
                 const expression = this.expression(node.expression)
                 if (expression.type !== "CallExpression" && expression.type !== "MethodCallExpression") {
                     this.report(node, "A statement must be a call")
@@ -824,19 +826,13 @@ class Lowerer {
                 return luau.unary(node.operator, this.expression(node.argument))
 
             case "MemberExpression":
-                return luau.member(this.expression(node.object), node.property.name)
-
             case "IndexExpression":
-                return luau.index(this.expression(node.object), this.expression(node.index))
-
             case "CallExpression":
-                return luau.call(this.expression(node.callee), node.arguments.map(a => this.expression(a)))
-
-            case "MethodCallExpression":
-                if (!luau.isLuauName(node.method.name)) {
-                    this.report(node.method, `'${node.method.name}' is a Luau keyword and cannot be called with ':'`)
-                }
-                return luau.methodCall(this.expression(node.object), node.method.name, node.arguments.map(a => this.expression(a)))
+            case "MethodCallExpression": {
+                const chain = optionalChain(node)
+                if (chain) return this.optionalChainExpression(chain)
+                return this.link(node, this.expression(linkObject(node)))
+            }
 
             case "ParenthesizedExpression":
                 return luau.parenthesized(this.expression(node.expression))
@@ -855,6 +851,99 @@ class Lowerer {
                     ...spanOf(node),
                 }
         }
+    }
+
+    /** One link of an access chain, read from `object`. */
+    private link(node: Link, object: L.Expression): L.Expression {
+        switch (node.type) {
+            case "MemberExpression":
+                return luau.member(object, node.property.name)
+            case "IndexExpression":
+                return luau.index(object, this.expression(node.index))
+            case "CallExpression":
+                return luau.call(object, node.arguments.map(a => this.expression(a)))
+            case "MethodCallExpression":
+                if (!luau.isLuauName(node.method.name)) {
+                    this.report(node.method, `'${node.method.name}' is a Luau keyword and cannot be called with ':'`)
+                }
+                return luau.methodCall(object, node.method.name, node.arguments.map(a => this.expression(a)))
+        }
+    }
+
+    // --------------------------------------------------------
+    // Optional chains
+    // --------------------------------------------------------
+    //
+    // `a?.b.c` is nil when `a` is, and then neither `.b` nor `.c` runs. Each
+    // `?.` tests what the chain holds so far, once: the value is kept in a
+    // local rather than read again.
+
+    /** The links of a chain from `?.` onwards, split into segments that each
+     *  start at a `?.` / `?:`. */
+    private segments(chain: Chain): Link[][] {
+        const out: Link[][] = []
+        for (const link of chain.links) {
+            if ((link as { optional?: boolean }).optional || !out.length) out.push([link])
+            else out[out.length - 1].push(link)
+        }
+        return out
+    }
+
+    private applySegment(segment: Link[], object: L.Expression): L.Expression {
+        return segment.reduce((value, link) => this.link(link, value), object)
+    }
+
+    /** `a?.b:m()` as a statement:
+     *  `do local ref = a if ref ~= nil then ref.b:m() end end` */
+    private optionalCallStatement(chain: Chain): L.Statement {
+        const segments = this.segments(chain)
+        const base = this.expression(chain.base)
+        // A name is only read, so a single test can use it as it is.
+        const ref = base.type === "Identifier" && segments.length === 1 ? base.name : this.names.fresh("ref")
+        const at = luau.identifier(ref)
+
+        const nest = (i: number): L.Statement[] => {
+            const value = this.applySegment(segments[i], at)
+            if (i === segments.length - 1) {
+                return [luau.callStatement(value as L.CallExpression | L.MethodCallExpression)]
+            }
+            return [luau.assign([at], [value]), luau.ifThen(luau.binary("~=", at, luau.nil()), nest(i + 1))]
+        }
+        const test = luau.ifThen(luau.binary("~=", at, luau.nil()), nest(0))
+        if (base.type === "Identifier" && base.name === ref) return test
+        return luau.doBlock([luau.local([ref], [base]), test])
+    }
+
+    /** `a?.b` as a value. The one-test form on a name is an `if` expression;
+     *  anything else runs in a function, so every link is evaluated at most
+     *  once and in order. */
+    private optionalChainExpression(chain: Chain): L.Expression {
+        const segments = this.segments(chain)
+        const base = this.expression(chain.base)
+        const last = chain.links[chain.links.length - 1]
+        // An `if` expression gives one value; a call may give more, as it
+        // would without the `?`.
+        if (base.type === "Identifier" && segments.length === 1 && last.type !== "CallExpression" && last.type !== "MethodCallExpression") {
+            return {
+                type: "IfElseExpression",
+                clauses: [{ condition: luau.binary("==", base, luau.nil()), body: luau.nil() }],
+                alternate: this.applySegment(segments[0], base),
+                line: base.line,
+                column: base.column,
+            }
+        }
+
+        const ref = this.names.fresh("ref")
+        const at = luau.identifier(ref)
+        const statements: L.Statement[] = [luau.local([ref], [base])]
+        segments.forEach((segment, i) => {
+            statements.push(luau.ifThen(luau.binary("==", at, luau.nil()), [luau.returns([luau.nil()])]))
+            const value = this.applySegment(segment, at)
+            statements.push(i === segments.length - 1 ? luau.returns([value]) : luau.assign([at], [value]))
+        })
+        const passesVarargs = statements.some(usesVararg)
+        const func = luau.functionExpression(luau.functionBody([], statements, passesVarargs))
+        return luau.call(luau.parenthesized(func), passesVarargs ? [vararg()] : [])
     }
 
     /** `` `${a} any` `` -> `("%s any"):format(tostring(a))` */
@@ -940,6 +1029,44 @@ class Lowerer {
 // ------------------------------------------------------------
 // Helpers
 // ------------------------------------------------------------
+
+type Link = T.MemberExpression | T.IndexExpression | T.CallExpression | T.MethodCallExpression
+
+/** An optional chain: the expression under its first `?.` / `?:`, and the
+ *  links read from it, innermost first. */
+interface Chain {
+    base: T.Expression
+    links: Link[]
+}
+
+function isLink(node: T.Expression): node is Link {
+    return node.type === "MemberExpression" || node.type === "IndexExpression"
+        || node.type === "CallExpression" || node.type === "MethodCallExpression"
+}
+
+function linkObject(node: Link): T.Expression {
+    return node.type === "CallExpression" ? node.callee : node.object
+}
+
+/** The chain `node` ends, when a `?.` or `?:` is in it. Parentheses end a
+ *  chain: `(a?.b).c` reads `.c` from whatever `(a?.b)` gave. */
+function optionalChain(node: T.Expression): Chain | undefined {
+    const spine: Link[] = []
+    for (let e: T.Expression = node; isLink(e); e = linkObject(e)) spine.unshift(e)
+    const first = spine.findIndex(link => (link as { optional?: boolean }).optional)
+    if (first < 0) return undefined
+    return { base: linkObject(spine[first]), links: spine.slice(first) }
+}
+
+/** Does `node` read `...` outside any function of its own? */
+function usesVararg(node: unknown): boolean {
+    if (Array.isArray(node)) return node.some(usesVararg)
+    if (!node || typeof node !== "object") return false
+    const record = node as Record<string, unknown>
+    if (record.type === "VarargExpression") return true
+    if (record.type === "FunctionExpression" || record.type === "LocalFunctionStatement" || record.type === "FunctionStatement") return false
+    return Object.values(record).some(usesVararg)
+}
 
 function spanOf(node: T.BaseNode): L.BaseNode {
     return { line: node.line, column: node.column }

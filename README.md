@@ -45,6 +45,9 @@ result.diagnostics   // { file, line, column, message, category: "syntax" | "mod
 | `[1, 2]` / `{ a: 1, b }` | `{ 1, 2 }` / `{ a = 1, b = b }` |
 | `{ ...base, a: 1 }` / `[...xs, 1]` | a small helper copying the parts in order |
 | `` `${a} any` `` | `("%s any"):format(tostring(a))` |
+| `a?.b` | `if a == nil then nil else a.b` |
+| `a?:m()` as a statement | `if a ~= nil then a:m() end` |
+| `f()?.b?:m(x)` | a function call that keeps each link in a local, so every link runs once, in order, and none after a nil |
 | `function f(n = 1, { x })` | `function f(n, arg) if n == nil then n = 1 end local x = arg.x ...` |
 | `const` / `let` | `local` |
 | `x as T`, `x satisfies T`, types, `declare` | removed |
