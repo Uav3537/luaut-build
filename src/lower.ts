@@ -288,7 +288,9 @@ class Lowerer {
 
         // Imports first: an export may name an imported binding.
         for (const statement of statements) {
-            if (statement.type !== "ImportStatement") continue
+            // `import type` exists for the type checker alone: no module is
+            // required for it, whatever it names.
+            if (statement.type !== "ImportStatement" || statement.isTypeOnly) continue
             const specifiers = [
                 ...(statement.defaultImport ? [{ local: statement.defaultImport, imported: "default" as string | undefined }] : []),
                 ...(statement.namespaceImport ? [{ local: statement.namespaceImport, imported: undefined }] : []),
@@ -542,6 +544,12 @@ class Lowerer {
                 return [{ type: "ContinueStatement", ...spanOf(node) }]
 
             case "ImportStatement":
+                // Types only: erased like every other type.
+                if (node.isTypeOnly) return []
+                this.report(node, this.options.module
+                    ? "Imports and exports belong at the top level of a module"
+                    : "Imports and exports need a bundle: build the project with luaut-build")
+                return []
             case "ExportStatement":
             case "ExportDefaultStatement":
             case "ExportNamedStatement":

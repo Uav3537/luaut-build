@@ -126,6 +126,7 @@ check("a parse error leaves no output",
     ((r) => [r.code, r.diagnostics.length > 0])(compile("const = 1")), [undefined, true])
 check("reassigning a const is an error",
     compile("const a = 1\na = 2").diagnostics.map(d => d.message), ["Cannot assign to 'a' — it is a const"])
+lowers("import type is erased", `import type { Shape } from "./m"\nconst s: Shape = { r: 1 }`, "local s = { r = 1 };")
 check("modules need a bundle",
     compile(`import { a } from "./m"`).diagnostics.map(d => d.message), ["Imports and exports need a bundle: build the project with luaut-build"])
 
@@ -299,6 +300,29 @@ function fails(name: string, result: BundleResult, message: string): void {
     const result = bundle({ entry: join(root, "main.luaut"), config: { types: [] } })
     check("bundle: a module imported only for types is left out", result.modules, ["main", "values"])
     runs("bundle: and the rest still runs", result, ["3"])
+}
+
+{
+    // `import type` is erased whatever it names: even a module whose code
+    // would run is never required for it.
+    const root = project({
+        "main.luaut": `import type { Shape, noisy } from "./noisy"\nimport type * as N from "./noisy"\nconst s: Shape = { r: 1 }\nconst f: typeof noisy = function() end\nconst n: N.Shape = s\nprint(s.r, n.r)\n`,
+        "noisy.luaut": `print("noisy ran")\nexport type Shape = { r: number }\nexport function noisy() end\n`,
+    })
+    const result = bundle({ entry: join(root, "main.luaut"), config: { types: [] } })
+    check("bundle: a module reached only through import type is left out", result.modules, ["main"])
+    runs("bundle: and never runs", result, ["1\t1"])
+}
+
+{
+    const root = project({
+        "main.luaut": `import type { value } from "./m"\nprint(value)\n`,
+        "m.luaut": `export const value = 1\n`,
+    })
+    const result = bundle({ entry: join(root, "main.luaut"), config: { types: [] } })
+    check("bundle: a type-only import used as a value is an error, and leaves no bundle",
+        [result.code, result.diagnostics.map(d => [d.category, d.message])],
+        [undefined, [["scope", "'value' is imported with 'import type' and can only be used as a type"]]])
 }
 
 {

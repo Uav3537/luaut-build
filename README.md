@@ -99,8 +99,9 @@ Modules follow ES module rules, including when they import each other:
   other module on every access.
 - **Read-only imports.** Assigning to an imported name, or to a member of a
   namespace (`import * as M`, then `M.x = 1`), is an error.
-- **Types only.** An import used only as a type is dropped. A module imported
-  only for types is left out of the bundle.
+- **Types only.** `import type` is erased whatever it names, and so is an
+  import used only as a type. A module reached only that way is left out of
+  the bundle and never runs.
 
 ## Tests
 
