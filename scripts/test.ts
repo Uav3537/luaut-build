@@ -448,6 +448,26 @@ function fails(name: string, result: BundleResult, message: string): void {
         code.includes("if root == nil then nil else root.name"), true)
 }
 
+{
+    const root = project({
+        "main.luaut": [
+            `const a = 1`,
+            `--@luaut-ignore`,
+            `a = 2`,
+            `const n: number = "x" --@luaut-expect-error covers the next line of code, not its own`,
+            `--@luaut-expect-error`,
+            `print(a)`,
+        ].join("\n"),
+        "quiet.luaut": `--@luaut-nocheck\nconst b = 1\nb = 2\nconst s: number = "x"\n`,
+    })
+    const loud = bundle({ entry: join(root, "main.luaut"), config: { types: [] } })
+    check("bundle: directives suppress scope and type errors, and an unused expect-error is one",
+        loud.diagnostics.map(d => `${d.line}: ${d.message}`),
+        ["4: Type '\"x\"' is not assignable to 'number'", "4: Unused '@luaut-expect-error' directive", "5: Unused '@luaut-expect-error' directive"])
+    const quiet = bundle({ entry: join(root, "quiet.luaut"), config: { types: [] } })
+    check("bundle: nocheck builds a file with scope errors", [quiet.diagnostics, quiet.code !== undefined], [[], true])
+}
+
 function findLuau(): string | undefined {
     const candidates = [process.env.LUAU, "luau"].filter((c): c is string => !!c)
     const empty = join(mkdtempSync(join(tmpdir(), "luaut-probe-")), "empty.luau")

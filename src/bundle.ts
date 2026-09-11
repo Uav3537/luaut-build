@@ -43,8 +43,8 @@ import { readFileSync } from "node:fs"
 import { dirname, relative, resolve } from "node:path"
 import {
     parse, analyzeScopes, analyzeTypes, moduleExports, resolveModulePath, resolveTypeLibraries,
-    ParseError, LexError,
-    type ModuleExports, type Program, type ScopeAnalysis, type LuautConfig, type TypeAnalysis,
+    directivesOf, applyDirectives, UNUSED_EXPECT_ERROR, ParseError, LexError,
+    type ModuleExports, type Program, type ScopeAnalysis, type LuautConfig, type TypeAnalysis, type Directives,
 } from "luaut-parser"
 import { parse as parseLuau, print, type Statement as LuauStatement, type TableExpression, type TableField } from "luau-parser"
 import { resolveConfig, type ConfigInput } from "./config.js"
@@ -105,11 +105,12 @@ export function bundle(options: BundleOptions): BundleResult {
 
     // Every module the entry reaches through an import, types included.
     const sources = new Map<string, SourceModule>()
+    const directives = new Map<string, Directives>()
     const queue = [entry]
     while (queue.length) {
         const file = queue.shift()!
         if (sources.has(file)) continue
-        const program = parseFile(file, diagnostics)
+        const program = parseFile(file, diagnostics, directives)
         if (!program) return { modules: [], diagnostics }
         const scopes = analyzeScopes(program)
         for (const d of scopes.diagnostics) {
@@ -158,6 +159,22 @@ export function bundle(options: BundleOptions): BundleResult {
             exportsName: lowered.exportsName,
             info: lowered.module,
         })
+    }
+
+    // `--@luaut-nocheck`, `--@luaut-ignore` and `--@luaut-expect-error` apply
+    // to scope and type errors, file by file.
+    for (const [file, fileDirectives] of directives) {
+        const semantic = diagnostics.filter(d => d.file === file && (d.category === "scope" || d.category === "type"))
+        const { kept, unusedExpectErrors } = applyDirectives(fileDirectives, semantic, d => d.line)
+        const suppressed = new Set(semantic.filter(d => !kept.includes(d)))
+        const remaining = diagnostics.filter(d => !suppressed.has(d))
+        diagnostics.length = 0
+        diagnostics.push(...remaining)
+        // Without type checking there is nothing an expect-error could expect.
+        if (options.typeCheck === false) continue
+        for (const d of unusedExpectErrors) {
+            diagnostics.push({ file, message: UNUSED_EXPECT_ERROR, line: d.line, column: d.column, category: "type" })
+        }
     }
 
     // The type checker reports a missing module too; say it once.
@@ -253,7 +270,7 @@ ${G} = {
 `
 }
 
-function parseFile(file: string, diagnostics: BundleDiagnostic[]): Program | undefined {
+function parseFile(file: string, diagnostics: BundleDiagnostic[], directives: Map<string, Directives>): Program | undefined {
     let text: string
     try {
         text = readFileSync(file, "utf8")
@@ -262,7 +279,9 @@ function parseFile(file: string, diagnostics: BundleDiagnostic[]): Program | und
         return undefined
     }
     try {
-        return parse(text)
+        const program = parse(text)
+        directives.set(file, directivesOf(text))
+        return program
     } catch (error) {
         if (error instanceof ParseError || error instanceof LexError) {
             const { line, column } = error as unknown as { line: number; column: number }
