@@ -21,19 +21,27 @@ build.
 ## API
 
 ```ts
-import { bundle } from "luaut-build"
+import { bundle, compile } from "luaut-build"
 
-const result = bundle({
+const result = await bundle({
     entry: "src/main.luaut",
     // A config file's path, or its contents:
     config: { types: ["roblox"], paths: { "@shared/*": ["src/shared/*"] } },
 })
 result.code          // the Luau bundle, unless a module failed
 result.diagnostics   // { file, line, column, message, category: "syntax" | "module" | "type" | "config" }
+
+// One file, no imports. The config is optional here too, and brings the same
+// type libraries — including what they lower.
+const one = await compile("const names = [1]\n", "luaut.config.json")
 ```
 
 `config` is typed `string | LuautConfigJson`. Left out, the nearest
-`luaut.config.json` above the entry applies.
+`luaut.config.json` above the entry applies — and for `compile`, nothing at
+all.
+
+Both are `async`: a type library may ship its own lowering, which is a
+JavaScript module the build loads.
 
 ## What becomes what
 
@@ -51,6 +59,31 @@ result.diagnostics   // { file, line, column, message, category: "syntax" | "mod
 | `function f(n = 1, { x })` | `function f(n, arg) if n == nil then n = 1 end local x = arg.x ...` |
 | `const` / `let` | `local` |
 | `x as T`, `x satisfies T`, types, `declare` | removed |
+| `names:filter(f)` | whatever the type library that declared `filter` says — see below |
+
+## What a type library lowers
+
+The compiler lowers luaut. What a *library* gives a value, the library also
+says how to run: `names:filter(f)` is a call to a function because
+`@luaut/lua` declares the method and ships the Luau behind it.
+
+A library names a module in its package.json (`"luaut": { "lowering":
+"lowering.mjs" }`) whose default export answers for a call:
+
+```js
+export default {
+    runtime: { array: "local __NAME__ = {}\nfunction __NAME__.filter(t, test) ... end" },
+    methodCall({ method, receiver, use }) {
+        if (receiver?.kind === "array" && method === "filter") return { callee: `${use("array")}.filter` }
+    },
+}
+```
+
+`receiver` is the luaut type the analyzer worked out; `use(key)` names the
+table from `runtime`, emitted once at the top of the output and only if a call
+needed it; the receiver becomes the call's first argument unless
+`passReceiver: false`. The last library loaded is asked first, and `undefined`
+leaves an ordinary Luau method call.
 
 ## Modules
 

@@ -36,6 +36,7 @@ import type * as L from "luau-parser"
 import { parse as parseLuau } from "luau-parser"
 import * as luau from "./luau.js"
 import { Names } from "./names.js"
+import type { LoadedLowering } from "./lowering.js"
 
 /** What lowering a file as a module of a bundle needs. */
 export interface ModuleContext {
@@ -60,22 +61,10 @@ export interface LowerOptions {
      *  They also say what a method call is called on, which decides whether
      *  `methods` claims it. */
     readonly types?: TypeAnalysis
-    /** The methods the project's type libraries give arrays and strings, with
-     *  the Luau that implements them — `luaut.methods` in a library's
-     *  package.json, read for the compiler by the caller. A method no library
-     *  claims is left as a plain Luau method call, which is what a string's
-     *  own `upper` wants. */
-    readonly methods?: readonly MethodLibrary[]
-}
-
-/** One library's answer to `names:filter(f)`. */
-export interface MethodLibrary {
-    /** What the methods are called on. */
-    readonly receiver: "array" | "string"
-    /** Luau defining the table they live in, with `__NAME__` for its local. */
-    readonly source: string
-    /** The names it implements; anything else is left alone. */
-    readonly names: readonly string[]
+    /** What the project's type libraries lower, already loaded (see
+     *  `loadLowerings`). The compiler lowers the language; a call written
+     *  against a library's types is the library's to explain. */
+    readonly lowerings?: readonly LoadedLowering[]
 }
 
 export interface LowerDiagnostic {
@@ -113,9 +102,9 @@ export function lower(program: T.Program, scopes: ScopeAnalysis, options: LowerO
 }
 
 /** A runtime helper the output needs, emitted once at the top of the file.
- *  A number is an index into `options.methods`: one table per library that
- *  gave a method, emitted only if a call reached it. */
-type Helper = "assign" | "concat" | number
+ *  `assign` and `concat` are the language's own (spreads); a `lowering` is a
+ *  table a type library asked for, by the key it gave it. */
+type Helper = "assign" | "concat" | { lowering: number; runtime: string }
 
 type Mode = "declare" | "assign"
 
@@ -204,66 +193,51 @@ class Lowerer {
         return luau.identifier(local)
     }
 
-    private helper(kind: Helper): L.Identifier {
+    private helper(kind: "assign" | "concat"): L.Identifier {
         let name = this.helpers.get(kind)
         if (!name) {
-            const what = typeof kind === "number" ? this.options.methods![kind].receiver : kind
-            name = this.names.fresh(`luaut_${what}`)
+            name = this.names.fresh(`luaut_${kind}`)
             this.helpers.set(kind, name)
         }
         return luau.identifier(name)
     }
 
-    /** `names:filter(f)` and `text:trim()` are calls on a table the output
-     *  carries, not on the value itself — nothing is attached to a table or to
-     *  the string metatable. Which table, and whether this is one of those
-     *  methods at all, is decided by the receiver's type: a string's `upper`
-     *  is Luau's own and stays a method call, and a method on a value whose
-     *  type is not known stays one too. */
-    private builtInMethod(node: T.MethodCallExpression): Helper | undefined {
-        const libraries = this.options.methods
-        if (!libraries?.length) return undefined
-        const type = this.options.types?.typeOf.get(node.object)
-        if (!type) return undefined
-        const kind = this.receiverKind(type)
-        if (!kind) return undefined
-        // The last library to claim a name is the one that answers, matching
-        // how a later definitions file's types win over an earlier one's.
-        for (let i = libraries.length - 1; i >= 0; i--) {
-            if (libraries[i].receiver === kind && libraries[i].names.includes(node.method.name)) return i
+    /** The local a library's runtime table gets in this file, emitting it the
+     *  first time something asks. Keyed by library and by the key the library
+     *  itself chose, so two libraries' tables never collide. */
+    private loweringRuntime(index: number, runtime: string): string {
+        const key = `${index}:${runtime}`
+        let name = this.loweringNames.get(key)
+        if (!name) {
+            name = this.names.fresh(`luaut_${runtime.replace(/[^A-Za-z0-9_]/g, "_")}`)
+            this.loweringNames.set(key, name)
+            this.loweringUsed.push({ index, runtime, name })
         }
-        return undefined
+        return name
     }
 
-    /** Is this an array, a string, or neither? `nil` members are ignored —
-     *  the value has already been narrowed or checked by the time it is
-     *  called on. */
-    private receiverKind(type: Type, seen = new Set<Type>()): "array" | "string" | undefined {
-        if (seen.has(type)) return undefined
-        seen.add(type)
-        switch (type.kind) {
-            case "array":
-            case "tuple":
-                return "array"
-            case "primitive":
-                return type.name === "string" ? "string" : undefined
-            case "literal":
-                return type.base === "string" ? "string" : undefined
-            case "union": {
-                const kinds = type.types
-                    .filter(m => !(m.kind === "primitive" && m.name === "nil"))
-                    .map(m => this.receiverKind(m, seen))
-                return kinds.length && kinds.every(k => k === kinds[0]) ? kinds[0] : undefined
-            }
-            case "genericRef": {
-                const alias = this.options.types?.aliases.get(type.name)
-                return alias ? this.receiverKind(alias, seen) : undefined
-            }
-            case "typeParam":
-                return type.constraint ? this.receiverKind(type.constraint, seen) : undefined
-            default:
-                return undefined
+    private readonly loweringNames = new Map<string, string>()
+    private readonly loweringUsed: { index: number; runtime: string; name: string }[] = []
+
+    /** What a library says `receiver:method(...)` is. The last library
+     *  loaded is asked first, so a project's own library can answer for a
+     *  method an earlier one also claims; no answer leaves an ordinary Luau
+     *  method call, which is what a value that answers to the method itself
+     *  wants (`text:upper()`). */
+    private loweredMethodCall(node: T.MethodCallExpression): { callee: string; passReceiver: boolean } | undefined {
+        const lowerings = this.options.lowerings
+        if (!lowerings?.length) return undefined
+        const receiver = this.options.types?.typeOf.get(node.object)
+        for (let i = lowerings.length - 1; i >= 0; i--) {
+            const answer = lowerings[i].plugin.methodCall?.({
+                method: node.method.name,
+                receiver,
+                argumentCount: node.arguments.length,
+                use: runtime => this.loweringRuntime(i, runtime),
+            })
+            if (answer) return { callee: answer.callee, passReceiver: answer.passReceiver !== false }
         }
+        return undefined
     }
 
     private helperDefinitions(): L.Statement[] {
@@ -283,9 +257,16 @@ class Lowerer {
                 luau.returns([luau.identifier("target")]),
             ], true)))
         }
-        for (const [kind, name] of this.helpers) {
-            if (typeof kind !== "number") continue
-            const source = this.options.methods![kind].source
+        for (const { index, runtime, name } of this.loweringUsed) {
+            const { plugin, from } = this.options.lowerings![index]
+            const source = plugin.runtime?.[runtime]
+            if (source === undefined) {
+                this.diagnostics.push({
+                    message: `'${from}' asked for a runtime it does not have: '${runtime}'`,
+                    line: 1, column: 1,
+                })
+                continue
+            }
             out.push(...parseLuau(source.replace(/__NAME__/g, name)).body.statements)
         }
         const concat = this.helpers.get("concat")
@@ -1040,10 +1021,9 @@ class Lowerer {
                 return luau.call(object, node.arguments.map(a => this.expression(a)))
             case "MethodCallExpression": {
                 const args = node.arguments.map(a => this.expression(a))
-                // A library index, and 0 is one of them.
-                const built = this.builtInMethod(node)
-                if (built !== undefined) {
-                    return luau.call(luau.member(this.helper(built), node.method.name), [object, ...args])
+                const lowered = this.loweredMethodCall(node)
+                if (lowered) {
+                    return luau.call(calleePath(lowered.callee), lowered.passReceiver ? [object, ...args] : args)
                 }
                 if (!luau.isLuauName(node.method.name)) {
                     this.report(node.method, `'${node.method.name}' is a Luau keyword and cannot be called with ':'`)
@@ -1249,6 +1229,12 @@ function usesVararg(node: unknown): boolean {
     if (record.type === "VarargExpression") return true
     if (record.type === "FunctionExpression" || record.type === "LocalFunctionStatement" || record.type === "FunctionStatement") return false
     return Object.values(record).some(usesVararg)
+}
+
+/** `luaut_array.filter` as an expression: a name, then a member per dot. */
+function calleePath(path: string): L.Expression {
+    const [head, ...rest] = path.split(".")
+    return rest.reduce<L.Expression>((value, name) => luau.member(value, name), luau.identifier(head))
 }
 
 function spanOf(node: T.BaseNode): L.BaseNode {

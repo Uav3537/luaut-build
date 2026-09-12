@@ -32,7 +32,7 @@ if (!entry) {
     process.exit(2)
 }
 
-const result = bundle({ entry, config, typeCheck })
+const result = await bundle({ entry, config, typeCheck })
 for (const d of result.diagnostics) {
     console.error(`${relative(process.cwd(), d.file)}:${d.line}:${d.column} ${d.message}`)
 }

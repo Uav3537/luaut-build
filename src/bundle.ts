@@ -48,7 +48,8 @@ import {
 } from "luaut-parser"
 import { parse as parseLuau, print, type Statement as LuauStatement, type TableExpression, type TableField } from "luau-parser"
 import { resolveConfig, type ConfigInput } from "./config.js"
-import { lower, type MethodLibrary, type ModuleInfo } from "./lower.js"
+import { lower, type ModuleInfo } from "./lower.js"
+import { loadLowerings } from "./lowering.js"
 import * as luau from "./luau.js"
 import { Names } from "./names.js"
 
@@ -93,7 +94,7 @@ interface SourceModule {
     readonly scopes: ScopeAnalysis
 }
 
-export function bundle(options: BundleOptions): BundleResult {
+export async function bundle(options: BundleOptions): Promise<BundleResult> {
     const entry = resolve(options.entry)
     const diagnostics: BundleDiagnostic[] = []
     const inline = options.config !== undefined && typeof options.config !== "string"
@@ -125,7 +126,14 @@ export function bundle(options: BundleOptions): BundleResult {
 
     // Types are needed either way: lowering reads them (`for x in list`).
     const analysis = analyzeModules([...sources.values()], config)
-    diagnostics.push(...analysis.methodProblems)
+
+    // What the project's type libraries lower. The compiler lowers luaut
+    // itself; a call written against a library's types is the library's to
+    // explain, and this is where those explanations come from.
+    const { lowerings, problems: loweringProblems } = await loadLowerings(analysis.lowerings)
+    for (const p of loweringProblems) {
+        diagnostics.push({ file: p.file, message: p.message, line: 1, column: 1, category: "config" })
+    }
     if (options.typeCheck !== false) diagnostics.push(...analysis.diagnostics)
 
     // Lower each module the entry needs at runtime: an import only of types
@@ -142,7 +150,7 @@ export function bundle(options: BundleOptions): BundleResult {
         const lowered = lower(source.program, source.scopes, {
             names,
             types: analysis.types.get(file),
-            methods: analysis.methods,
+            lowerings,
             module: {
                 name: source.name,
                 require: requireExpression,
@@ -308,33 +316,13 @@ function analyzeModules(
 ): {
     types: Map<string, TypeAnalysis>
     diagnostics: BundleDiagnostic[]
-    methods: MethodLibrary[]
-    methodProblems: BundleDiagnostic[]
+    lowerings: { file: string; from: string }[]
 } {
     const out: BundleDiagnostic[] = []
     const analyses = new Map<string, TypeAnalysis>()
-    const libraries = config ? resolveTypeLibraries(config) : { files: [], methods: [], problems: [] }
+    const libraries = config ? resolveTypeLibraries(config) : { files: [], lowerings: [], problems: [] }
     for (const p of libraries.problems) out.push({ file: p.file, message: p.message, line: p.line ?? 1, column: p.column ?? 1, category: "config" })
 
-    // What those libraries give arrays and strings: their types came with the
-    // definitions above, and this is the code behind them.
-    const methods: MethodLibrary[] = []
-    const methodProblems: BundleDiagnostic[] = []
-    for (const runtime of libraries.methods) {
-        try {
-            methods.push({
-                receiver: runtime.receiver,
-                source: readFileSync(runtime.file, "utf8"),
-                names: runtime.names,
-            })
-        } catch {
-            methodProblems.push({
-                file: runtime.file,
-                message: `Cannot read the method runtime '${runtime.file}' that '${runtime.from}' declares`,
-                line: 1, column: 1, category: "config",
-            })
-        }
-    }
     const libs = libraries.files.map(file => parse(readFileSync(file, "utf8")))
     const globals = libs.flatMap(lib => lib.body.statements.flatMap(s => (s.type === "DeclareStatement" ? [s.name] : [])))
 
@@ -388,5 +376,5 @@ function analyzeModules(
             out.push({ file: module.file, message: d.message, line: at.line.start, column: at.column.start, category: "type" })
         }
     }
-    return { types: analyses, diagnostics: out, methods, methodProblems }
+    return { types: analyses, diagnostics: out, lowerings: [...libraries.lowerings] }
 }
