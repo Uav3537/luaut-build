@@ -48,7 +48,7 @@ import {
 } from "luaut-parser"
 import { parse as parseLuau, print, type Statement as LuauStatement, type TableExpression, type TableField } from "luau-parser"
 import { resolveConfig, type ConfigInput } from "./config.js"
-import { lower, type ModuleInfo } from "./lower.js"
+import { lower, type MethodLibrary, type ModuleInfo } from "./lower.js"
 import * as luau from "./luau.js"
 import { Names } from "./names.js"
 
@@ -125,6 +125,7 @@ export function bundle(options: BundleOptions): BundleResult {
 
     // Types are needed either way: lowering reads them (`for x in list`).
     const analysis = analyzeModules([...sources.values()], config)
+    diagnostics.push(...analysis.methodProblems)
     if (options.typeCheck !== false) diagnostics.push(...analysis.diagnostics)
 
     // Lower each module the entry needs at runtime: an import only of types
@@ -141,6 +142,7 @@ export function bundle(options: BundleOptions): BundleResult {
         const lowered = lower(source.program, source.scopes, {
             names,
             types: analysis.types.get(file),
+            methods: analysis.methods,
             module: {
                 name: source.name,
                 require: requireExpression,
@@ -303,11 +305,36 @@ function importedSpecifiers(program: Program): string[] {
 function analyzeModules(
     modules: SourceModule[],
     config: LuautConfig | undefined,
-): { types: Map<string, TypeAnalysis>; diagnostics: BundleDiagnostic[] } {
+): {
+    types: Map<string, TypeAnalysis>
+    diagnostics: BundleDiagnostic[]
+    methods: MethodLibrary[]
+    methodProblems: BundleDiagnostic[]
+} {
     const out: BundleDiagnostic[] = []
     const analyses = new Map<string, TypeAnalysis>()
-    const libraries = config ? resolveTypeLibraries(config) : { files: [], problems: [] }
+    const libraries = config ? resolveTypeLibraries(config) : { files: [], methods: [], problems: [] }
     for (const p of libraries.problems) out.push({ file: p.file, message: p.message, line: p.line ?? 1, column: p.column ?? 1, category: "config" })
+
+    // What those libraries give arrays and strings: their types came with the
+    // definitions above, and this is the code behind them.
+    const methods: MethodLibrary[] = []
+    const methodProblems: BundleDiagnostic[] = []
+    for (const runtime of libraries.methods) {
+        try {
+            methods.push({
+                receiver: runtime.receiver,
+                source: readFileSync(runtime.file, "utf8"),
+                names: runtime.names,
+            })
+        } catch {
+            methodProblems.push({
+                file: runtime.file,
+                message: `Cannot read the method runtime '${runtime.file}' that '${runtime.from}' declares`,
+                line: 1, column: 1, category: "config",
+            })
+        }
+    }
     const libs = libraries.files.map(file => parse(readFileSync(file, "utf8")))
     const globals = libs.flatMap(lib => lib.body.statements.flatMap(s => (s.type === "DeclareStatement" ? [s.name] : [])))
 
@@ -361,5 +388,5 @@ function analyzeModules(
             out.push({ file: module.file, message: d.message, line: at.line.start, column: at.column.start, category: "type" })
         }
     }
-    return { types: analyses, diagnostics: out }
+    return { types: analyses, diagnostics: out, methods, methodProblems }
 }

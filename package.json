@@ -40,6 +40,7 @@
     "luaut-parser": "^3.1.0"
   },
   "devDependencies": {
+    "@luaut/lua": "^2.0.0",
     "@types/node": "^22.20.2",
     "tsup": "^8.5.1",
     "tsx": "^4.23.13",

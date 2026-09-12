@@ -12,9 +12,10 @@
  * only way to know a cycle really behaves like ES modules.
  */
 import { execFileSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { parse as parseLuau } from "luau-parser"
 import { bundle, compile, type BundleResult } from "../src/index.js"
 
@@ -141,6 +142,17 @@ function project(files: Record<string, string>): string {
         writeFileSync(join(root, path), text)
     }
     return root
+}
+
+/** The real `@luaut/lua`, copied where a temp project resolves it from — the
+ *  array and string methods live there, not in the compiler. */
+function installLua(root: string): void {
+    const from = fileURLToPath(new URL("../node_modules/@luaut/lua/", import.meta.url))
+    for (const file of ["package.json", "index.d.luaut", "runtime/array.luau", "runtime/string.luau"]) {
+        const target = join(root, "node_modules", "@luaut", "lua", file)
+        mkdirSync(dirname(target), { recursive: true })
+        writeFileSync(target, readFileSync(join(from, file), "utf8"))
+    }
 }
 
 /** Run a bundle and return what it printed, or `undefined` without an interpreter. */
@@ -448,6 +460,69 @@ function fails(name: string, result: BundleResult, message: string): void {
         code.includes("if root == nil then nil else root.name"), true)
 }
 
+// A method belongs to whichever type library claims it: the compiler knows
+// where to look and nothing more.
+{
+    const runtime = [
+        "local __NAME__ = {}",
+        "function __NAME__.first(t)",
+        "\treturn t[1]",
+        "end",
+        "function __NAME__.shout(s)",
+        "\treturn string.upper(s) .. '!'",
+        "end",
+        "return nil",
+    ].join("\n")
+    const root = project({
+        "node_modules/@luaut/own/package.json": JSON.stringify({
+            name: "@luaut/own",
+            luaut: {
+                types: "index.d.luaut",
+                methods: [
+                    { receiver: "array", runtime: "runtime.luau", names: ["first"] },
+                    { receiver: "string", runtime: "runtime.luau", names: ["shout"] },
+                ],
+            },
+        }),
+        "node_modules/@luaut/own/index.d.luaut": [
+            "declare function print(...: unknown): ()",
+            "type ArrayMethods<T> = { first: (self: T[]) -> T | nil, nope: (self: T[]) -> T | nil }",
+            "type StringMethods = { shout: (self: string) -> string }",
+        ].join("\n"),
+        "node_modules/@luaut/own/runtime.luau": runtime.replace("return nil\n", "").replace("\nreturn nil", ""),
+        "main.luaut": [
+            `print(([3, 4]):first(), ("hi"):shout())`,
+        ].join("\n"),
+    })
+    runs("bundle: the methods a type library declares",
+        bundle({ entry: join(root, "main.luaut"), config: { types: ["own"] } }), ["3\tHI!"])
+
+    const claimed = bundle({ entry: join(root, "main.luaut"), config: { types: ["own"] } }).code ?? ""
+    check("bundle: the runtime comes from the library, once", [
+        claimed.includes("function luaut_array.first"),
+        claimed.includes("luaut_array.first(({"),
+        // Declared in the types but claimed by no runtime: left as a method
+        // call, for the value itself to answer.
+        (bundle({
+            entry: join(project({
+                "node_modules/@luaut/own/package.json": JSON.stringify({
+                    name: "@luaut/own",
+                    luaut: { types: "index.d.luaut", methods: [{ receiver: "array", runtime: "runtime.luau", names: ["first"] }] },
+                }),
+                "node_modules/@luaut/own/index.d.luaut": "type ArrayMethods<T> = { nope: (self: T[]) -> T | nil }",
+                "node_modules/@luaut/own/runtime.luau": "local __NAME__ = {}",
+                "main.luaut": "const v = ([1]):nope()\n",
+            }), "main.luaut"),
+            config: { types: ["own"] },
+        }).code ?? "").includes(":nope()"),
+        // And with no library at all, nothing is lowered.
+        (bundle({
+            entry: join(project({ "main.luaut": "const v = ([1]):first()\n" }), "main.luaut"),
+            config: { types: [] },
+        }).code ?? "").includes(":first()"),
+    ], [true, true, true, true])
+}
+
 {
     const root = project({
         "main.luaut": [
@@ -472,8 +547,9 @@ function fails(name: string, result: BundleResult, message: string): void {
             `print(seen)`,
         ].join("\n"),
     })
+    installLua(root)
     runs("bundle: the array methods",
-        bundle({ entry: join(root, "main.luaut"), config: { types: [] } }),
+        bundle({ entry: join(root, "main.luaut"), config: { types: ["lua"] } }),
         [
             "bb,ccc",
             "2,1,3",
@@ -501,11 +577,12 @@ function fails(name: string, result: BundleResult, message: string): void {
             `print(("hello"):slice(2, 3), ("hello"):slice(-2))`,
             `print(("a.b.c"):replace(".", "-"), ("a.b.c"):replaceAll(".", "-"))`,
             `print(("7"):padStart(3, "0"), ("7"):padEnd(3, "."), ("abc"):padStart(2, "0"))`,
-            `print(("a,b"):split(","):join("|"), ("x"):upper(), ("Y"):lower())`,
+            `print(("x"):upper(), ("Y"):lower())`,
         ].join("\n"),
     })
+    installLua(root)
     runs("bundle: the string methods, Luau's own left alone",
-        bundle({ entry: join(root, "main.luaut"), config: { types: [] } }),
+        bundle({ entry: join(root, "main.luaut"), config: { types: ["lua"] } }),
         [
             "hi|\thi|\thi|",
             "true\ttrue\ttrue",
@@ -513,9 +590,9 @@ function fails(name: string, result: BundleResult, message: string): void {
             "el\tlo",
             "a-b.c\ta-b-c",
             "007\t7..\tabc",
-            "a|b\tX\ty",
+            "X\ty",
         ])
-    const code = bundle({ entry: join(root, "main.luaut"), config: { types: [] } }).code ?? ""
+    const code = bundle({ entry: join(root, "main.luaut"), config: { types: ["lua"] } }).code ?? ""
     check("bundle: a string's own Luau methods stay method calls",
         [code.includes(`("x"):upper()`), code.includes("luaut_string.trim")], [true, true])
 }

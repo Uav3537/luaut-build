@@ -36,7 +36,6 @@ import type * as L from "luau-parser"
 import { parse as parseLuau } from "luau-parser"
 import * as luau from "./luau.js"
 import { Names } from "./names.js"
-import { ARRAY_METHODS, ARRAY_SOURCE, STRING_METHODS, STRING_SOURCE } from "./runtime.js"
 
 /** What lowering a file as a module of a bundle needs. */
 export interface ModuleContext {
@@ -57,8 +56,26 @@ export interface LowerOptions {
     /** Names already taken beyond the file's own — a bundle's. */
     readonly names?: Names
     /** The file's types. They decide what `for x in t` means: over a table
-     *  it yields the values, which in Luau needs a key variable before `x`. */
+     *  it yields the values, which in Luau needs a key variable before `x`.
+     *  They also say what a method call is called on, which decides whether
+     *  `methods` claims it. */
     readonly types?: TypeAnalysis
+    /** The methods the project's type libraries give arrays and strings, with
+     *  the Luau that implements them — `luaut.methods` in a library's
+     *  package.json, read for the compiler by the caller. A method no library
+     *  claims is left as a plain Luau method call, which is what a string's
+     *  own `upper` wants. */
+    readonly methods?: readonly MethodLibrary[]
+}
+
+/** One library's answer to `names:filter(f)`. */
+export interface MethodLibrary {
+    /** What the methods are called on. */
+    readonly receiver: "array" | "string"
+    /** Luau defining the table they live in, with `__NAME__` for its local. */
+    readonly source: string
+    /** The names it implements; anything else is left alone. */
+    readonly names: readonly string[]
 }
 
 export interface LowerDiagnostic {
@@ -95,8 +112,10 @@ export function lower(program: T.Program, scopes: ScopeAnalysis, options: LowerO
     return new Lowerer(program, scopes, options).run()
 }
 
-/** A runtime helper the output needs, emitted once at the top of the file. */
-type Helper = "assign" | "concat" | "array" | "string"
+/** A runtime helper the output needs, emitted once at the top of the file.
+ *  A number is an index into `options.methods`: one table per library that
+ *  gave a method, emitted only if a call reached it. */
+type Helper = "assign" | "concat" | number
 
 type Mode = "declare" | "assign"
 
@@ -188,7 +207,8 @@ class Lowerer {
     private helper(kind: Helper): L.Identifier {
         let name = this.helpers.get(kind)
         if (!name) {
-            name = this.names.fresh(`luaut_${kind}`)
+            const what = typeof kind === "number" ? this.options.methods![kind].receiver : kind
+            name = this.names.fresh(`luaut_${what}`)
             this.helpers.set(kind, name)
         }
         return luau.identifier(name)
@@ -201,11 +221,17 @@ class Lowerer {
      *  is Luau's own and stays a method call, and a method on a value whose
      *  type is not known stays one too. */
     private builtInMethod(node: T.MethodCallExpression): Helper | undefined {
+        const libraries = this.options.methods
+        if (!libraries?.length) return undefined
         const type = this.options.types?.typeOf.get(node.object)
         if (!type) return undefined
         const kind = this.receiverKind(type)
-        if (kind === "array") return ARRAY_METHODS.has(node.method.name) ? "array" : undefined
-        if (kind === "string") return STRING_METHODS.has(node.method.name) ? "string" : undefined
+        if (!kind) return undefined
+        // The last library to claim a name is the one that answers, matching
+        // how a later definitions file's types win over an earlier one's.
+        for (let i = libraries.length - 1; i >= 0; i--) {
+            if (libraries[i].receiver === kind && libraries[i].names.includes(node.method.name)) return i
+        }
         return undefined
     }
 
@@ -257,9 +283,10 @@ class Lowerer {
                 luau.returns([luau.identifier("target")]),
             ], true)))
         }
-        for (const [kind, source] of [["array", ARRAY_SOURCE], ["string", STRING_SOURCE]] as const) {
-            const name = this.helpers.get(kind)
-            if (name) out.push(...parseLuau(source.replace(/__NAME__/g, name)).body.statements)
+        for (const [kind, name] of this.helpers) {
+            if (typeof kind !== "number") continue
+            const source = this.options.methods![kind].source
+            out.push(...parseLuau(source.replace(/__NAME__/g, name)).body.statements)
         }
         const concat = this.helpers.get("concat")
         if (concat) {
@@ -1013,8 +1040,11 @@ class Lowerer {
                 return luau.call(object, node.arguments.map(a => this.expression(a)))
             case "MethodCallExpression": {
                 const args = node.arguments.map(a => this.expression(a))
+                // A library index, and 0 is one of them.
                 const built = this.builtInMethod(node)
-                if (built) return luau.call(luau.member(this.helper(built), node.method.name), [object, ...args])
+                if (built !== undefined) {
+                    return luau.call(luau.member(this.helper(built), node.method.name), [object, ...args])
+                }
                 if (!luau.isLuauName(node.method.name)) {
                     this.report(node.method, `'${node.method.name}' is a Luau keyword and cannot be called with ':'`)
                 }
