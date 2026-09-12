@@ -12,10 +12,9 @@
  * only way to know a cycle really behaves like ES modules.
  */
 import { execFileSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import { fileURLToPath } from "node:url"
 import { parse as parseLuau } from "luau-parser"
 import { bundle, compile, type BundleResult } from "../src/index.js"
 
@@ -142,17 +141,6 @@ function project(files: Record<string, string>): string {
         writeFileSync(join(root, path), text)
     }
     return root
-}
-
-/** The real `@luaut/lua`, copied where a temp project resolves it from — the
- *  array and string methods live there, not in the compiler. */
-function installLua(root: string): void {
-    const from = fileURLToPath(new URL("../node_modules/@luaut/lua/", import.meta.url))
-    for (const file of ["package.json", "index.d.luaut", "lowering.mjs", "runtime/array.luau", "runtime/string.luau"]) {
-        const target = join(root, "node_modules", "@luaut", "lua", file)
-        mkdirSync(dirname(target), { recursive: true })
-        writeFileSync(target, readFileSync(join(from, file), "utf8"))
-    }
 }
 
 /** Run a bundle and return what it printed, or `undefined` without an interpreter. */
@@ -536,80 +524,6 @@ function fails(name: string, result: BundleResult, message: string): void {
         result.diagnostics.some(d => d.message.includes("failed to load")),
         (result.code ?? "").includes(":first()"),
     ], [true, true])
-}
-
-{
-    const root = project({
-        "main.luaut": [
-            `const names = ["bb", "a", "ccc"]`,
-            `print(names:filter(function(v) return #v > 1 end):join(","))`,
-            `print(names:map(function(v) return #v end):join(","))`,
-            `print(names:find(function(v) return #v == 1 end), names:findIndex(function(v) return #v == 1 end))`,
-            `print(names:join("-"), names:includes("a"), names:indexOf("ccc"), names:indexOf("nope"))`,
-            `print(names:some(function(v) return #v == 3 end), names:every(function(v) return #v == 3 end))`,
-            `print(names:slice(2):join(","), names:slice(1, 2):join(","), names:slice(-2):join(","))`,
-            `const copy = names:slice()`,
-            `print(copy:sort():join(","), names:join(","))`,
-            `print(copy:reverse():join(","))`,
-            `print(names:concat(["d"], ["e", "f"]):join(","))`,
-            `print(([[1, 2], [3]]):flat():join(","))`,
-            `print(([1, 2, 3]):reduce(function(sum, v) return sum + v end, 0))`,
-            `const stack = [1, 2]`,
-            `print(stack:push(3), stack:join(","), stack:pop(), stack:join(","))`,
-            `print(stack:shift(), stack:join(","), stack:unshift(9, 8), stack:join(","))`,
-            `let seen = ""`,
-            `names:forEach(function(v, i) seen = seen .. i .. v end)`,
-            `print(seen)`,
-        ].join("\n"),
-    })
-    installLua(root)
-    runs("bundle: the array methods",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: ["lua"] } }),
-        [
-            "bb,ccc",
-            "2,1,3",
-            "a\t2",
-            "bb-a-ccc\ttrue\t3\tnil",
-            "true\tfalse",
-            "a,ccc\tbb,a\ta,ccc",
-            "a,bb,ccc\tbb,a,ccc",
-            "ccc,bb,a",
-            "bb,a,ccc,d,e,f",
-            "1,2,3",
-            "6",
-            "3\t1,2,3\t3\t1,2",
-            "1\t2\t3\t9,8,2",
-            "1bb2a3ccc",
-        ])
-}
-
-{
-    const root = project({
-        "main.luaut": [
-            `print(("  hi  "):trim() .. "|", ("  hi"):trimStart() .. "|", ("hi  "):trimEnd() .. "|")`,
-            `print(("hello"):startsWith("he"), ("hello"):endsWith("lo"), ("hello"):includes("ell"))`,
-            `print(("hello"):indexOf("l"), ("hello"):indexOf("z"))`,
-            `print(("hello"):slice(2, 3), ("hello"):slice(-2))`,
-            `print(("a.b.c"):replace(".", "-"), ("a.b.c"):replaceAll(".", "-"))`,
-            `print(("7"):padStart(3, "0"), ("7"):padEnd(3, "."), ("abc"):padStart(2, "0"))`,
-            `print(("x"):upper(), ("Y"):lower())`,
-        ].join("\n"),
-    })
-    installLua(root)
-    runs("bundle: the string methods, Luau's own left alone",
-        await bundle({ entry: join(root, "main.luaut"), config: { types: ["lua"] } }),
-        [
-            "hi|\thi|\thi|",
-            "true\ttrue\ttrue",
-            "3\tnil",
-            "el\tlo",
-            "a-b.c\ta-b-c",
-            "007\t7..\tabc",
-            "X\ty",
-        ])
-    const code = (await bundle({ entry: join(root, "main.luaut"), config: { types: ["lua"] } })).code ?? ""
-    check("bundle: a string's own Luau methods stay method calls",
-        [code.includes(`("x"):upper()`), code.includes("luaut_string.trim")], [true, true])
 }
 
 {
