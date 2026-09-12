@@ -350,7 +350,11 @@ function analyzeModules(
             if (d.kind !== "undeclared") continue
             out.push({ file: module.file, message: d.message, line: d.node.line.start, column: d.node.column.start, category: "type" })
         }
-        const types = analyzeTypes(module.program, scopes, { libs, resolveModule: resolverFor(module.file) })
+        const types = analyzeTypes(module.program, scopes, {
+            libs,
+            resolveModule: resolverFor(module.file),
+            reportUnknownTypes: libs.length > 0,
+        })
         analyses.set(module.file, types)
         for (const d of types.diagnostics) {
             const at = d.node as { line: { start: number }; column: { start: number } }
