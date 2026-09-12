@@ -451,6 +451,33 @@ function fails(name: string, result: BundleResult, message: string): void {
 {
     const root = project({
         "main.luaut": [
+            `let argued = 0`,
+            `function arg(): string`,
+            `    argued += 1`,
+            `    return "!"`,
+            `end`,
+            `const call: ((s: string) -> string) | nil = function(s: string): string return "got" .. s end`,
+            `const none: ((s: string) -> string) | nil = nil`,
+            `print(call?.(arg()), none?.(arg()), argued)`,
+            `none?.(arg())`,
+            `call?.(arg())`,
+            `print(argued)`,
+            `type Names = "a" | "b"`,
+            `const per = { a: function(): string return "A" end } as const satisfies { [Names]: () -> string }`,
+            `let key: Names = "a"`,
+            `print(per[key]?.())`,
+            `key = "b"`,
+            `print(per[key]?.())`,
+        ].join("\n"),
+    })
+    runs("bundle: optional calls",
+        bundle({ entry: join(root, "main.luaut"), config: { types: [] } }),
+        ["got!\tnil\t1", "2", "A", "nil"])
+}
+
+{
+    const root = project({
+        "main.luaut": [
             `const a = 1`,
             `--@luaut-ignore`,
             `a = 2`,
