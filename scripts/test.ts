@@ -522,6 +522,38 @@ function fails(name: string, result: BundleResult, message: string): void {
         bundle({ entry: join(root, "main.luaut"), config: { types: ["./defs.d.luaut"] } }), ["12"])
 }
 
+{
+    const source = [
+        "function Setup()",
+        "    let EventManager = {",
+        "        Connections: [1, 2],",
+        "        Count: function()",
+        "            return #EventManager.Connections",
+        "        end",
+        "    }",
+        "    return EventManager",
+        "end",
+        "function Sibling()",
+        "    const read = function() return later end",
+        "    const later = 7",
+        "    return read()",
+        "end",
+        "const shadow = 1",
+        "do",
+        "    const shadow = shadow + 1",
+        "    print(Setup().Count(), Sibling(), shadow)",
+        "end",
+    ].join("\n")
+    const root = project({ "main.luaut": source })
+    runs("bundle: a closure reads the name its own value is bound to",
+        bundle({ entry: join(root, "main.luaut"), config: { types: [] } }), ["2\t7\t2"])
+    const single = compile(source)
+    if (single.code !== undefined) {
+        runs("compile: the same outside a bundle",
+            { code: single.code, diagnostics: [], modules: [] } as unknown as BundleResult, ["2\t7\t2"])
+    }
+}
+
 function findLuau(): string | undefined {
     const candidates = [process.env.LUAU, "luau"].filter((c): c is string => !!c)
     const empty = join(mkdtempSync(join(tmpdir(), "luaut-probe-")), "empty.luau")

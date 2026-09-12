@@ -458,30 +458,60 @@ class Lowerer {
     // scope analysis reports.) A bundle's module and a file's top level hoist
     // the whole function instead.
 
-    /** Function declarations in `statements` that are referred to above
-     *  themselves. */
-    private referencedAhead(statements: readonly T.Statement[]): Set<T.FunctionDeclaration> {
-        const out = new Set<T.FunctionDeclaration>()
+    /** Declarations in `statements` that something before them reads: a
+     *  function called above it, or a value a closure in its own initializer
+     *  reads (`local t = { f = function() return t end }`). Lua's `local`
+     *  starts after its statement, so those names are declared at the top of
+     *  the block and assigned where they are written. */
+    private referencedAhead(statements: readonly T.Statement[]): {
+        functions: Set<T.FunctionDeclaration>
+        variables: Set<T.VariableDeclaration>
+        names: string[]
+    } {
+        const functions = new Set<T.FunctionDeclaration>()
+        const variables = new Set<T.VariableDeclaration>()
+        const names: string[] = []
+        const before = (node: T.BaseNode, line: number, column: number): boolean =>
+            line < node.line.start || (line === node.line.start && column < node.column.start)
         for (const statement of statements) {
-            if (statement.type !== "FunctionDeclaration") continue
-            const binding = this.bindingByDeclaration.get(statement.name)
-            const at = statement.name
-            if (binding?.references.some(r => r.line.start < at.line.start || (r.line.start === at.line.start && r.column.start < at.column.start))) {
-                out.add(statement)
+            if (statement.type === "FunctionDeclaration") {
+                const binding = this.bindingByDeclaration.get(statement.name)
+                if (binding?.references.some(r => before(statement.name, r.line.start, r.column.start))) {
+                    functions.add(statement)
+                    names.push(this.name(statement.name.name))
+                }
+                continue
             }
+            if (statement.type !== "VariableDeclaration") continue
+            const patterns = statement.names.flatMap(identifierPatterns)
+            // A read from inside the statement's own value counts: it runs
+            // later, when the name is there.
+            const end = { line: { start: statement.line.end }, column: { start: statement.column.end } } as T.BaseNode
+            const needed = patterns.some(pattern => {
+                const binding = this.bindingByDeclaration.get(pattern)
+                return binding?.references.some(r => before(end, r.line.start, r.column.start))
+            })
+            if (!needed) continue
+            variables.add(statement)
+            for (const pattern of patterns) names.push(this.name(pattern.name))
         }
-        return out
+        return { functions, variables, names }
     }
 
     private blockStatements(statements: readonly T.Statement[]): L.Statement[] {
         const ahead = this.referencedAhead(statements)
-        if (!ahead.size) return statements.flatMap(s => this.statement(s))
-        const names = [...ahead].map(f => this.name(f.name.name))
+        if (!ahead.names.length) return statements.flatMap(s => this.statement(s))
         return [
-            luau.local(names, []),
-            ...statements.flatMap(s => (s.type === "FunctionDeclaration" && ahead.has(s)
-                ? [this.functionStatement(this.reference(s.name), s, s.func, false)]
-                : this.statement(s))),
+            luau.local(ahead.names, []),
+            ...statements.flatMap(s => {
+                if (s.type === "FunctionDeclaration" && ahead.functions.has(s)) {
+                    return [this.functionStatement(this.reference(s.name), s, s.func, false)]
+                }
+                if (s.type === "VariableDeclaration" && ahead.variables.has(s)) {
+                    return this.variableDeclaration(s, "assign")
+                }
+                return this.statement(s)
+            }),
         ]
     }
 
@@ -489,7 +519,7 @@ class Lowerer {
      *  declaration is hoisted whole, as in a module: every top-level name is
      *  declared first, then the functions are defined, then the rest runs. */
     private topLevel(statements: readonly T.Statement[]): L.Statement[] {
-        if (!this.referencedAhead(statements).size) return statements.flatMap(s => this.statement(s))
+        if (!this.referencedAhead(statements).names.length) return statements.flatMap(s => this.statement(s))
         const locals: string[] = []
         const hoisted: L.Statement[] = []
         const body: L.Statement[] = []
