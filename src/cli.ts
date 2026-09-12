@@ -32,15 +32,24 @@ if (!entry) {
     process.exit(2)
 }
 
-const result = await bundle({ entry, config, typeCheck })
-for (const d of result.diagnostics) {
-    console.error(`${relative(process.cwd(), d.file)}:${d.line}:${d.column} ${d.message}`)
+// In a function, not at the top level: bundling is async, and a top-level
+// `await` cannot be compiled to CommonJS, which this ships as too.
+async function main(from: string): Promise<never> {
+    const result = await bundle({ entry: from, config, typeCheck })
+    for (const d of result.diagnostics) {
+        console.error(`${relative(process.cwd(), d.file)}:${d.line}:${d.column} ${d.message}`)
+    }
+    if (result.code === undefined) {
+        console.error("no bundle written")
+        process.exit(1)
+    }
+    const target = out ?? from.replace(/\.luaut$/, "") + ".luau"
+    writeFileSync(target, result.code)
+    console.log(`${target}: ${result.modules.length} module${result.modules.length === 1 ? "" : "s"}`)
+    process.exit(result.diagnostics.length ? 1 : 0)
 }
-if (result.code === undefined) {
-    console.error("no bundle written")
+
+main(entry).catch(error => {
+    console.error(error instanceof Error ? error.message : error)
     process.exit(1)
-}
-const target = out ?? entry.replace(/\.luaut$/, "") + ".luau"
-writeFileSync(target, result.code)
-console.log(`${target}: ${result.modules.length} module${result.modules.length === 1 ? "" : "s"}`)
-process.exit(result.diagnostics.length ? 1 : 0)
+})
