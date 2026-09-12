@@ -44,5 +44,9 @@
     "tsup": "^8.5.1",
     "tsx": "^4.23.13",
     "typescript": "^5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Uav3537/luaut-build.git"
   }
 }
