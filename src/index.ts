@@ -4,3 +4,6 @@ export { bundle, type BundleOptions, type BundleResult, type BundleDiagnostic } 
 export { compile, type CompileResult, type Diagnostic } from "./compile.js"
 export { resolveConfig, type ConfigInput, type LuautConfigJson, type ResolvedConfig } from "./config.js"
 export { lower, type LowerOptions, type LowerResult, type LowerDiagnostic, type ModuleContext } from "./lower.js"
+// What a type library writes its lowering against.
+export { loadLowerings, type LoadedLowering, type LoweringProblem } from "./lowering.js"
+export type { LoweringPlugin, MethodCall, MethodLowering } from "./lowering.js"

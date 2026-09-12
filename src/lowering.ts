@@ -1,58 +1,28 @@
 /**
- * Lowering a type library brings with it.
+ * Loading the lowering a type library brings with it.
  *
- * The compiler lowers luaut itself — `import`, `export`, `const`, optional
- * chains, the things the language means on its own. Everything a *library*
- * gives a value it must also say how to run: `names:filter(f)` is a call to a
- * function because `@luaut/lua` declares the method and ships the Luau behind
- * it, not because the compiler has heard of `filter`.
+ * The compiler lowers luaut itself — `import`, `export`, `a ? b : c`, `?.`,
+ * destructuring, spreads, template strings: the things the language means on
+ * its own. Everything a *library* gives a value it must also say how to run:
+ * `names:filter(f)` is a call to a function because `@luaut/lua` declares the
+ * method and ships the Luau behind it, not because the compiler has heard of
+ * `filter`.
  *
  * A library names its module in package.json:
  *
  *     "luaut": { "types": "index.d.luaut", "lowering": "lowering.mjs" }
  *
- * and the module's default export is a `LoweringPlugin`. The compiler asks
- * each plugin, the last library loaded first, and takes the first answer.
+ * and the module's default export is a `LoweringPlugin` (declared in
+ * luaut-parser, and re-exported here). The compiler asks each plugin, the
+ * last library loaded first, and takes the first answer.
  */
 import { pathToFileURL } from "node:url"
-import type { Type } from "luaut-parser"
+import type { LoweringPlugin } from "luaut-parser"
 
-export interface LoweringPlugin {
-    /** Luau the plugin needs in the output, by a key it chooses. Each is a
-     *  file's worth of source with `__NAME__` standing for the local the
-     *  compiler gives it, and is emitted once, only if `use` asked for it:
-     *
-     *      local __NAME__ = {}
-     *      function __NAME__.filter(t, test) ... end
-     */
-    readonly runtime?: Readonly<Record<string, string>>
-
-    /** What `receiver:method(...)` becomes. `undefined` leaves it a plain
-     *  Luau method call, which is what a value that answers to the method
-     *  itself wants (`text:upper()`). */
-    methodCall?(call: MethodCall): MethodLowering | undefined
-}
-
-export interface MethodCall {
-    /** The name written after `:`. */
-    readonly method: string
-    /** The receiver's luaut type, as the analyzer worked it out — `undefined`
-     *  when nothing typed it, where a plugin should decline. */
-    readonly receiver: Type | undefined
-    /** How many arguments were written. */
-    readonly argumentCount: number
-    /** The local name the output gives one of `runtime`'s entries, emitting
-     *  it if this is the first call that needed it. */
-    use(runtime: string): string
-}
-
-export interface MethodLowering {
-    /** What to call instead: a name, or a `table.member` path. Usually built
-     *  from `use(...)`. */
-    readonly callee: string
-    /** Pass the receiver as the first argument. Default: yes. */
-    readonly passReceiver?: boolean
-}
+// The contract itself is declared in luaut-parser, so a type library can be
+// written against it with `import type { LoweringPlugin } from "luaut-parser"`
+// — without depending on the compiler that calls it.
+export type { LoweringPlugin, MethodCall, MethodLowering } from "luaut-parser"
 
 export interface LoadedLowering {
     readonly plugin: LoweringPlugin
