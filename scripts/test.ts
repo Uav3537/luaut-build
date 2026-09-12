@@ -506,6 +506,22 @@ function fails(name: string, result: BundleResult, message: string): void {
     if (single.code !== undefined) runs("compile: hoisted functions run", { code: single.code, diagnostics: [], modules: [] } as unknown as BundleResult, ["even\t3\teven\todd"])
 }
 
+{
+    const root = project({
+        "tags.luaut": [
+            "export function Tags(a: number, b: number): boolean",
+            "export function Tags(a?: number, b?: number): string",
+            "export function Tags(a: number = 1, b?: number): string",
+            "    return tostring(a) .. tostring(b)",
+            "end",
+        ].join("\n"),
+        "main.luaut": `import { Tags } from "./tags"\nprint(Tags(1, 2))\n`,
+        "defs.d.luaut": "declare function print(...: unknown): ()\ndeclare function tostring(value: unknown): string\n",
+    })
+    runs("bundle: an exported overload set is one function",
+        bundle({ entry: join(root, "main.luaut"), config: { types: ["./defs.d.luaut"] } }), ["12"])
+}
+
 function findLuau(): string | undefined {
     const candidates = [process.env.LUAU, "luau"].filter((c): c is string => !!c)
     const empty = join(mkdtempSync(join(tmpdir(), "luaut-probe-")), "empty.luau")
