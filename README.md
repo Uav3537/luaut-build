@@ -70,12 +70,13 @@ says how to run: `names:filter(f)` is a call to a function because
 A library names a module in its package.json (`"luaut": { "lowering":
 "lowering.mjs" }`) whose default export answers for a call. The contract is
 `LoweringPlugin`, declared in luaut-parser and re-exported here, so a library
-can be written in TypeScript against it without depending on the compiler:
+can be checked against it — by JSDoc, or in TypeScript — without depending on
+the compiler:
 
-```ts
-import type { LoweringPlugin } from "luaut-parser"
-
-const plugin: LoweringPlugin = {
+```js
+// @ts-check
+/** @type {import("luaut-parser").LoweringPlugin} */
+const plugin = {
     runtime: { array: "local __NAME__ = {}\nfunction __NAME__.filter(t, test) ... end" },
     methodCall({ method, receiver, use }) {
         if (receiver?.kind === "array" && method === "filter") {
