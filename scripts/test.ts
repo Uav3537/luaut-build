@@ -674,6 +674,10 @@ function findLuau(): string | undefined {
     return undefined
 }
 
+await lowers("an array of the varargs is Lua's own table of them",
+    ["function join(...)", "    const parts = [...]", "    return parts", "end"].join("\n"),
+    "local function join(...) local parts = { ... }; return parts; end;")
+
 // --- classes ----------------------------------------------------------------
 // What a class lowers to is one table per class and one table per instance,
 // with the instance's metatable pointing at the class — so the only way to be
@@ -758,6 +762,86 @@ function findLuau(): string | undefined {
     ])
 }
 
+// The memory model, as the language promises it: an instance points at its
+// class, a class points at the one it extends, and nothing is copied per
+// instance. Only running it can show that.
+{
+    const root = project({
+        "luaut.config.json": JSON.stringify({ types: [], sourceMap: null }),
+        "box.luaut": [
+            "export default class Box<T>",
+            "    value: T",
+            "    constructor(value: T)",
+            "        this.value = value",
+            "    end",
+            "    function get(): T",
+            "        return this.value",
+            "    end",
+            "    function map<R>(f: (value: T) -> R): Box<R>",
+            "        return new Box(f(this.value))",
+            "    end",
+            "end",
+            "",
+        ].join("\n"),
+        "main.luaut": [
+            `import Box from "./box"`,
+            "",
+            "class Base",
+            "    n = 1",
+            "end",
+            "class Derived extends Base",
+            "end",
+            "",
+            "const base = new Base()",
+            "const derived = new Derived()",
+            "print(base.ClassObject == Base, derived.ClassObject == Derived)",
+            "print(Derived.ParentClass == Base, Base.ParentClass == nil)",
+            "print(derived.ClassObject.ParentClass == Base)",
+            "-- The class is one table, shared: nothing of it sits on an instance.",
+            "print(rawget(derived, \"ClassObject\") == nil, rawget(derived, \"n\") == 1)",
+            "",
+            "const numbers = new Box(41)",
+            "print(numbers:get() + 1)",
+            "print(numbers:map(function(n) return tostring(n) .. \"!\" end):get())",
+            "",
+            "class Ints extends Box<number>",
+            "    constructor(n: number)",
+            "        super(n)",
+            "    end",
+            "    function double(): number",
+            "        return this:get() * 2",
+            "    end",
+            "end",
+            "print(new Ints(21):double())",
+            "",
+            "const Counter = class",
+            "    n = 0",
+            "    function bump(): number",
+            "        this.n += 1",
+            "        return this.n",
+            "    end",
+            "end",
+            "const counter = new Counter()",
+            "counter:bump()",
+            "print(counter:bump(), counter.ClassObject == Counter)",
+            "",
+        ].join("\n"),
+    })
+    const result = await bundle({ entry: join(root, "main.luaut") })
+    check("class: the bundle with generics, a class value and a default export type-checks",
+        result.diagnostics.map(d => d.message), [])
+    runs("class: an instance points at its class, and a class at the one it extends", result, [
+        "true\ttrue",
+        "true\ttrue",
+        "true",
+        "true\ttrue",
+        "42",
+        "41!",
+        "42",
+        "2\ttrue",
+    ])
+}
+
 // A class with no accessors anywhere in its chain keeps the plain
 // `__index = class` lookup: the metatable is the class table itself.
 await lowers("class: the simple case is the plain Lua idiom",
@@ -771,6 +855,7 @@ await lowers("class: the simple case is the plain Lua idiom",
         "end",
     ].join("\n"),
     "local function luaut_class(base) local class = { __getters = {}, __setters = {} }; class.__index = class; "
+    + "class.ClassObject = class; class.ParentClass = base; "
     + "if base ~= nil then setmetatable(class, { __index = base }); setmetatable(class.__getters, { __index = base.__getters }); "
     + "setmetatable(class.__setters, { __index = base.__setters }); end; return class; end; "
     + "local function luaut_accessors(class) "

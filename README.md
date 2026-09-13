@@ -60,6 +60,7 @@ JavaScript module the build loads.
 | `const` / `let` | `local` |
 | `class C ... end` | one table for the class, one per instance — see below |
 | `new C(x)` | `C.new(x)` |
+| `[...]` | `{...}` — the varargs as an array |
 | `x as T`, `x satisfies T`, types, `declare` | removed |
 | `names:filter(f)` | whatever the type library that declared `filter` says — see below |
 
@@ -103,6 +104,16 @@ luaut_accessors(Dog)
 that already exists, so a derived class builds one table, not one per level.
 `new` is a real function on the class table — `new Dog(x)` and `Dog.new(x)`
 are the same call.
+
+Two links come with every class, and they cost an instance nothing because
+they live on the class table: `ClassObject`, which an instance reads through
+its metatable to reach its own class, and `ParentClass`, which a class reads
+to reach the one it extends.
+
+A class written as a value (`const Counter = class ... end`) is the same code,
+inside a function that runs where the class is written and hands the table
+back — an expression has no room for statements. Type parameters leave no
+trace at all: `Box<number>` and `Box<string>` compile to the one `Box`.
 
 Two helpers go in at the top of any file that declares a class.
 `luaut_class(base)` makes the table, points `__index` at it, and chains it to

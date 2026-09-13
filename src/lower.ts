@@ -450,9 +450,18 @@ class Lowerer {
                 case "VariableDeclaration":
                     body.push(...this.variableDeclaration(declaration, "assign"))
                     break
-                case "ExportDefaultStatement":
-                    body.push(luau.assign([luau.member(exportsTable(), "default")], [this.expression(declaration.declaration)]))
+                case "ExportDefaultStatement": {
+                    // `export default class Name ... end` builds the class
+                    // under its name, then exports that.
+                    const exported = declaration.declaration
+                    if (exported.type === "ClassDeclaration") {
+                        body.push(...this.classDeclaration(exported, "assign"))
+                        body.push(luau.assign([luau.member(exportsTable(), "default")], [this.reference(exported.name)]))
+                    } else {
+                        body.push(luau.assign([luau.member(exportsTable(), "default")], [this.expression(exported)]))
+                    }
                     break
+                }
                 case "ReturnStatement":
                     // An early `return` stops the module; a value has nowhere to go.
                     if (declaration.arguments.length) this.report(declaration, "A module cannot return a value; export it instead")
@@ -790,7 +799,13 @@ class Lowerer {
      *  `__getters`/`__setters` chain to the base's, so a derived class sees
      *  the accessors it inherits; `__index` only becomes a function for a
      *  class that has some, which leaves every other class on the plain
-     *  `__index = class` fast path. */
+     *  `__index = class` fast path.
+     *
+     *  `ClassObject` and `ParentClass` are the links the memory model
+     *  promises: an instance reads `ClassObject` through its metatable and
+     *  lands on its own class, and a class reads `ParentClass` and lands on
+     *  the one it extends. Both live on the class table, so an instance
+     *  carries neither. */
     private classRuntimeStatements(): L.Statement[] {
         if (!this.classHelpers) return []
         const { build, accessors } = this.classHelpers
@@ -798,6 +813,8 @@ class Lowerer {
 local function ${build}(base)
     local class = { __getters = {}, __setters = {} }
     class.__index = class
+    class.ClassObject = class
+    class.ParentClass = base
     if base ~= nil then
         setmetatable(class, { __index = base })
         setmetatable(class.__getters, { __index = base.__getters })
@@ -830,14 +847,32 @@ end
     }
 
     /** The class being lowered, so `super` knows what to name. */
-    private classContext?: T.ClassDeclaration
+    private classContext?: T.ClassLike
+
+    /** A class written where a value goes. Building it takes statements, and
+     *  an expression has no room for them, so they go in a function that runs
+     *  where the class is written and hands the class table back. */
+    private classExpression(node: T.ClassExpression): L.Expression {
+        const local = this.names.fresh(node.name ? this.name(node.name.name) : "class")
+        const statements = this.classStatements(node, luau.identifier(local), local)
+        return luau.call(luau.parenthesized(luau.functionExpression(
+            luau.functionBody([], [...statements, luau.returns([luau.identifier(local)])]))), [])
+    }
 
     private classDeclaration(node: T.ClassDeclaration, mode: Mode): L.Statement[] {
+        const name = this.name(node.name.name)
+        return mode === "declare"
+            ? this.classStatements(node, luau.identifier(name), name)
+            : this.classStatements(node, this.reference(node.name))
+    }
+
+    /** `declare` names the local the class table goes in; without it the
+     *  table is assigned to `self`, which a module has already declared. */
+    private classStatements(node: T.ClassLike, self: L.Expression, declare?: string): L.Statement[] {
         const { build, accessors } = this.classRuntime()
-        const self = mode === "declare" ? luau.identifier(this.name(node.name.name)) : this.reference(node.name)
         const create = luau.call(luau.identifier(build), [node.superclass ? this.reference(node.superclass) : luau.nil()])
-        const out: L.Statement[] = [mode === "declare"
-            ? luau.local([this.name(node.name.name)], [create])
+        const out: L.Statement[] = [declare !== undefined
+            ? luau.local([declare], [create])
             : luau.assign([self], [create])]
 
         const previous = this.classContext
@@ -879,7 +914,7 @@ end
     /** `Class.__init(this, ...)` — what every instance of the class runs.
      *  Kept apart from `new` so `super(...)` can run the base's on the
      *  instance already being built rather than making a second one. */
-    private classInit(node: T.ClassDeclaration, self: L.Expression): L.Statement {
+    private classInit(node: T.ClassLike, self: L.Expression): L.Statement {
         const instance = this.thisName()
         const initializers = node.members
             .filter((m): m is T.ClassField => m.type === "ClassField" && !m.isStatic && m.init !== undefined)
@@ -910,7 +945,7 @@ end
     }
 
     /** `Class.new(...)`: the instance, its metatable, its constructor. */
-    private classNew(node: T.ClassDeclaration, self: L.Expression): L.Statement {
+    private classNew(node: T.ClassLike, self: L.Expression): L.Statement {
         const instance = this.thisName()
         const body = luau.functionBody([], [
             luau.local([instance], [luau.call(this.builtin("setmetatable"), [luau.table([]), self])]),
@@ -1223,6 +1258,9 @@ end
 
             case "SuperExpression":
                 return this.superClassReference(node)
+
+            case "ClassExpression":
+                return this.classExpression(node)
 
             case "MemberExpression":
             case "IndexExpression":
