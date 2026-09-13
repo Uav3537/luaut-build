@@ -1229,7 +1229,7 @@ end
             if (through !== undefined) {
                 return luau.call(luau.member(this.superClassReference(node), through), [
                     luau.identifier(this.thisName()),
-                    ...node.arguments.map(argument => this.expression(argument)),
+                    ...this.callArguments(node.arguments),
                 ])
             }
         }
@@ -1261,10 +1261,16 @@ end
             case "NewExpression":
                 // `new Name(args)` is the class's own `Name.new(args)`.
                 return luau.call(luau.member(this.expression(node.callee), "new"),
-                    node.arguments.map(argument => this.expression(argument)))
+                    this.callArguments(node.arguments))
 
             case "SuperExpression":
                 return this.superClassReference(node)
+
+            case "SpreadElement":
+                // Only an argument list and an array literal accept one, and
+                // both lower it themselves; the parser produces none elsewhere.
+                this.report(node, "'...' can only spread into a call's arguments or an array")
+                return luau.nil()
 
             case "ClassExpression":
                 return this.classExpression(node)
@@ -1297,6 +1303,24 @@ end
         }
     }
 
+    /** A call's arguments. `f(a, ...xs)` is Lua's own last-argument
+     *  expansion, `f(a, table.unpack(xs))`; a spread anywhere else cannot be,
+     *  since only the last value of a list expands, so the whole argument list
+     *  is built as an array first and that is what expands. */
+    private callArguments(args: readonly T.Expression[]): L.Expression[] {
+        const spreads = args.filter(a => a.type === "SpreadElement")
+        if (!spreads.length) return args.map(a => this.expression(a))
+        const unpack = (value: L.Expression): L.Expression =>
+            luau.call(luau.member(this.builtin("table"), "unpack"), [value])
+        const last = args[args.length - 1]
+        if (spreads.length === 1 && last.type === "SpreadElement") {
+            return [...args.slice(0, -1).map(a => this.expression(a)), unpack(this.expression(last.argument))]
+        }
+        return [unpack(this.arrayExpression({
+            type: "ArrayExpression", elements: [...args], ...spanOf(args[0]),
+        } as T.ArrayExpression))]
+    }
+
     /** One link of an access chain, read from `object`. */
     private link(node: Link, object: L.Expression): L.Expression {
         switch (node.type) {
@@ -1305,9 +1329,9 @@ end
             case "IndexExpression":
                 return luau.index(object, this.expression(node.index))
             case "CallExpression":
-                return luau.call(object, node.arguments.map(a => this.expression(a)))
+                return luau.call(object, this.callArguments(node.arguments))
             case "MethodCallExpression": {
-                const args = node.arguments.map(a => this.expression(a))
+                const args = this.callArguments(node.arguments)
                 const lowered = this.loweredMethodCall(node)
                 if (lowered) {
                     return luau.call(calleePath(lowered.callee), lowered.passReceiver ? [object, ...args] : args)

@@ -674,6 +674,22 @@ function findLuau(): string | undefined {
     return undefined
 }
 
+// A spread argument is `table.unpack` — directly when it is last, which is
+// the only place Lua expands a list, and around the whole argument list
+// otherwise.
+await lowers("a spread argument last is Lua's own expansion",
+    "declare xs: number[]\nf(1, ...xs)",
+    "f(1, table.unpack(xs));")
+await lowers("a spread anywhere else builds the list first",
+    "declare xs: number[]\nf(...xs, 1)",
+    "local function luaut_concat(...) local result = {}; "
+    + "for i = 1, select(\"#\", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; "
+    + "return result; end; "
+    + "f(table.unpack(luaut_concat(xs, { 1 })));")
+await lowers("bare `...` is the pack, not a spread",
+    "function f(...)\n    g(...)\nend",
+    "local function f(...) g(...); end;")
+
 // A rest parameter is Lua's `{...}` under a name: the function still takes
 // `...`, and the array of it is a local.
 await lowers("a rest parameter is the varargs, named",

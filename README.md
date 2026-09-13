@@ -62,6 +62,8 @@ JavaScript module the build loads.
 | `new C(x)` | `C.new(x)` |
 | `[...]` | `{...}` — the varargs as an array |
 | `function f(a, ...rest)` | `function f(a, ...) local rest = {...}` |
+| `f(a, ...xs)` | `f(a, table.unpack(xs))` |
+| `f(...xs, a)` | the list built first, then `table.unpack` of it |
 | `x as T`, `x satisfies T`, types, `declare` | removed |
 | `names:filter(f)` | whatever the type library that declared `filter` says — see below |
 
