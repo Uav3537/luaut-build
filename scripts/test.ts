@@ -674,6 +674,12 @@ function findLuau(): string | undefined {
     return undefined
 }
 
+// A rest parameter is Lua's `{...}` under a name: the function still takes
+// `...`, and the array of it is a local.
+await lowers("a rest parameter is the varargs, named",
+    ["function join(sep, ...parts)", "    return parts", "end"].join("\n"),
+    "local function join(sep, ...) local parts = { ... }; return parts; end;")
+
 await lowers("an array of the varargs is Lua's own table of them",
     ["function join(...)", "    const parts = [...]", "    return parts", "end"].join("\n"),
     "local function join(...) local parts = { ... }; return parts; end;")

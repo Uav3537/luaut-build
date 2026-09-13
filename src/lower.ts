@@ -1196,12 +1196,19 @@ end
         // `function T:m()` has an injected `self`; Luau's `:` supplies it.
         const params = func.isMethod ? func.params.slice(1) : func.params
         const prelude: L.Statement[] = []
-        const names = params.map(p => {
+        const names: string[] = []
+        for (const p of params) {
+            // `...rest: T[]` is Lua's own `{...}`: the function still takes
+            // `...`, and the array of it is a local the body reads by name.
+            if (p.rest) {
+                prelude.push(luau.local([this.name(p.name)], [luau.table([{ type: "TableFieldPositional", value: vararg() }])]))
+                continue
+            }
             const name = p.pattern ? this.names.fresh("arg") : this.name(p.name)
             if (p.default) prelude.push(this.defaultValue(luau.identifier(name), p.default))
             if (p.pattern) prelude.push(...this.destructure(p.pattern, luau.identifier(name), "declare"))
-            return name
-        })
+            names.push(name)
+        }
         return { ...luau.functionBody(names, [], func.hasVarargs), body: this.block(func.body, prelude) }
     }
 

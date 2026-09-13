@@ -61,6 +61,7 @@ JavaScript module the build loads.
 | `class C ... end` | one table for the class, one per instance — see below |
 | `new C(x)` | `C.new(x)` |
 | `[...]` | `{...}` — the varargs as an array |
+| `function f(a, ...rest)` | `function f(a, ...) local rest = {...}` |
 | `x as T`, `x satisfies T`, types, `declare` | removed |
 | `names:filter(f)` | whatever the type library that declared `filter` says — see below |
 
