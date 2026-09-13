@@ -400,7 +400,7 @@ function fails(name: string, result: BundleResult, message: string): void {
 {
     const root = project({
         "main.luaut": [
-            `type Node = { name: string, child: Node | nil, greet: (self: Node, suffix: string) -> string, pair: () -> (number, number) }`,
+            `type Node = { name: string, child: Node | nil, greet: (self: Node, suffix: string) => string, pair: () => (number, number) }`,
             `let reads = 0`,
             `let argued = 0`,
             `function arg(): string`,
@@ -476,8 +476,8 @@ function fails(name: string, result: BundleResult, message: string): void {
     })
     const definitions = [
         "declare function print(...: unknown): ()",
-        "type ArrayMethods<T> = { first: (self: T[]) -> T | nil, nope: (self: T[]) -> T | nil }",
-        "type StringMethods = { shout: (self: string) -> string }",
+        "type ArrayMethods<T> = { first: (self: T[]) => T | nil, nope: (self: T[]) => T | nil }",
+        "type StringMethods = { shout: (self: string) => string }",
     ].join("\n")
 
     const root = project({
@@ -534,14 +534,14 @@ function fails(name: string, result: BundleResult, message: string): void {
             `    argued += 1`,
             `    return "!"`,
             `end`,
-            `const call: ((s: string) -> string) | nil = function(s: string): string return "got" .. s end`,
-            `const none: ((s: string) -> string) | nil = nil`,
+            `const call: ((s: string) => string) | nil = function(s: string): string return "got" .. s end`,
+            `const none: ((s: string) => string) | nil = nil`,
             `print(call?.(arg()), none?.(arg()), argued)`,
             `none?.(arg())`,
             `call?.(arg())`,
             `print(argued)`,
             `type Names = "a" | "b"`,
-            `const per = { a: function(): string return "A" end } as const satisfies { [Names]: () -> string }`,
+            `const per = { a: function(): string return "A" end } as const satisfies { [Names]: () => string }`,
             `let key: Names = "a"`,
             `print(per[key]?.())`,
             `key = "b"`,
@@ -806,7 +806,7 @@ await lowers("an array of the varargs is Lua's own table of them",
             "    function get(): T",
             "        return this.value",
             "    end",
-            "    function map<R>(f: (value: T) -> R): Box<R>",
+            "    function map<R>(f: (value: T) => R): Box<R>",
             "        return new Box(f(this.value))",
             "    end",
             "end",
@@ -903,7 +903,7 @@ await lowers("class: the simple case is the plain Lua idiom",
 await lowers("class: new is a call of the class's own constructor",
     [
         "declare class Vec { x: number }",
-        "declare Vec: { new: (x: number) -> Vec }",
+        "declare Vec: { new: (x: number) => Vec }",
         "const v = new Vec(1)",
     ].join("\n"),
     "local v = Vec.new(1);")
