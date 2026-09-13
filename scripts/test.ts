@@ -686,6 +686,13 @@ await lowers("a spread anywhere else builds the list first",
     + "for i = 1, select(\"#\", ...) do local part = select(i, ...); table.move(part, 1, #part, #result + 1, result); end; "
     + "return result; end; "
     + "f(table.unpack(luaut_concat(xs, { 1 })));")
+await lowers("a `return` spreads the same way a call does",
+    "declare xs: number[]\nfunction f()\n    return ...xs\nend",
+    "local function f() return table.unpack(xs); end;")
+await lowers("and so does a declaration",
+    "declare xs: number[]\nconst a, b = ...xs",
+    "local a, b = table.unpack(xs);")
+
 await lowers("bare `...` is the pack, not a spread",
     "function f(...)\n    g(...)\nend",
     "local function f(...) g(...); end;")

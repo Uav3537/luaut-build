@@ -724,7 +724,7 @@ class Lowerer {
             }
 
             case "ReturnStatement":
-                return [luau.returns(node.arguments.map(e => this.expression(e)))]
+                return [luau.returns(this.values(node.arguments))]
 
             case "BreakStatement":
                 return [{ type: "BreakStatement", ...spanOf(node) }]
@@ -1011,7 +1011,7 @@ end
             const exported = node.names.flatMap(identifierPatterns).filter(p => this.isRewritten(p))
             return exported.length ? [luau.assign(exported.map(p => this.reference(p)), exported.map(() => luau.nil()))] : []
         }
-        const init = node.init.map(e => this.expression(e))
+        const init = this.values(node.init)
         if (node.names.every(n => n.type === "IdentifierPattern")) {
             const names = node.names as T.IdentifierPattern[]
             return mode === "declare"
@@ -1048,9 +1048,9 @@ end
 
     private assignment(node: T.AssignmentStatement): L.Statement[] {
         if (node.targets.every(t => t.type !== "ObjectPattern" && t.type !== "ArrayPattern")) {
-            return [luau.assign(node.targets.map(t => this.expression(t as T.Expression)), node.values.map(e => this.expression(e)))]
+            return [luau.assign(node.targets.map(t => this.expression(t as T.Expression)), this.values(node.values))]
         }
-        const values = node.values.map(e => this.expression(e))
+        const values = this.values(node.values)
         const only = node.targets.length === 1 && values.length === 1 ? node.targets[0] : undefined
         if (only && (only.type === "ObjectPattern" || only.type === "ArrayPattern") && values[0].type === "Identifier") {
             const statements = this.destructure(only, values[0], "assign")
@@ -1229,7 +1229,7 @@ end
             if (through !== undefined) {
                 return luau.call(luau.member(this.superClassReference(node), through), [
                     luau.identifier(this.thisName()),
-                    ...this.callArguments(node.arguments),
+                    ...this.values(node.arguments),
                 ])
             }
         }
@@ -1261,7 +1261,7 @@ end
             case "NewExpression":
                 // `new Name(args)` is the class's own `Name.new(args)`.
                 return luau.call(luau.member(this.expression(node.callee), "new"),
-                    this.callArguments(node.arguments))
+                    this.values(node.arguments))
 
             case "SuperExpression":
                 return this.superClassReference(node)
@@ -1303,21 +1303,22 @@ end
         }
     }
 
-    /** A call's arguments. `f(a, ...xs)` is Lua's own last-argument
-     *  expansion, `f(a, table.unpack(xs))`; a spread anywhere else cannot be,
-     *  since only the last value of a list expands, so the whole argument list
-     *  is built as an array first and that is what expands. */
-    private callArguments(args: readonly T.Expression[]): L.Expression[] {
-        const spreads = args.filter(a => a.type === "SpreadElement")
-        if (!spreads.length) return args.map(a => this.expression(a))
+    /** A list of values — a call's arguments, a `return`'s, a declaration's,
+     *  an assignment's. `f(a, ...xs)` is Lua's own last-value expansion,
+     *  `f(a, table.unpack(xs))`; a spread anywhere else cannot be, since only
+     *  the last value of a list expands, so the whole list is built as an
+     *  array first and that is what expands. */
+    private values(list: readonly T.Expression[]): L.Expression[] {
+        const spreads = list.filter(a => a.type === "SpreadElement")
+        if (!spreads.length) return list.map(a => this.expression(a))
         const unpack = (value: L.Expression): L.Expression =>
             luau.call(luau.member(this.builtin("table"), "unpack"), [value])
-        const last = args[args.length - 1]
+        const last = list[list.length - 1]
         if (spreads.length === 1 && last.type === "SpreadElement") {
-            return [...args.slice(0, -1).map(a => this.expression(a)), unpack(this.expression(last.argument))]
+            return [...list.slice(0, -1).map(a => this.expression(a)), unpack(this.expression(last.argument))]
         }
         return [unpack(this.arrayExpression({
-            type: "ArrayExpression", elements: [...args], ...spanOf(args[0]),
+            type: "ArrayExpression", elements: [...list], ...spanOf(list[0]),
         } as T.ArrayExpression))]
     }
 
@@ -1329,9 +1330,9 @@ end
             case "IndexExpression":
                 return luau.index(object, this.expression(node.index))
             case "CallExpression":
-                return luau.call(object, this.callArguments(node.arguments))
+                return luau.call(object, this.values(node.arguments))
             case "MethodCallExpression": {
-                const args = this.callArguments(node.arguments)
+                const args = this.values(node.arguments)
                 const lowered = this.loweredMethodCall(node)
                 if (lowered) {
                     return luau.call(calleePath(lowered.callee), lowered.passReceiver ? [object, ...args] : args)
