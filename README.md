@@ -58,8 +58,59 @@ JavaScript module the build loads.
 | `f()?.b?:m(x)` | a function call that keeps each link in a local, so every link runs once, in order, and none after a nil |
 | `function f(n = 1, { x })` | `function f(n, arg) if n == nil then n = 1 end local x = arg.x ...` |
 | `const` / `let` | `local` |
+| `class C ... end` | one table for the class, one per instance — see below |
+| `new C(x)` | `C.new(x)` |
 | `x as T`, `x satisfies T`, types, `declare` | removed |
 | `names:filter(f)` | whatever the type library that declared `filter` says — see below |
+
+## Classes
+
+`class ... end` is sugar over the Lua idiom, and it lowers to that idiom and
+nothing more: one table per class, holding its methods and its statics, and
+one table per instance whose metatable is the class. An instance reaches the
+class directly — nothing is copied per instance.
+
+```luau
+class Dog extends Animal
+    breed = "corgi"
+    constructor(name: string)
+        super(name)
+    end
+    function speak(): string
+        return super.speak() .. " woof"
+    end
+end
+```
+
+```lua
+local Dog = luaut_class(Animal)
+function Dog.speak(this)
+    return Animal.speak(this) .. " woof"
+end
+function Dog.__init(this, name)
+    Animal.__init(this, name)      -- super(name)
+    this.breed = "corgi"           -- the field initializers, after super
+end
+function Dog.new(...)
+    local this = setmetatable({}, Dog)
+    Dog.__init(this, ...)
+    return this
+end
+luaut_accessors(Dog)
+```
+
+`__init` is what `super(...)` calls: it runs the constructor on an instance
+that already exists, so a derived class builds one table, not one per level.
+`new` is a real function on the class table — `new Dog(x)` and `Dog.new(x)`
+are the same call.
+
+Two helpers go in at the top of any file that declares a class.
+`luaut_class(base)` makes the table, points `__index` at it, and chains it to
+the base — for the statics, and for the getter and setter tables. Getters and
+setters are what the second helper is for: `luaut_accessors(class)` replaces
+`__index` with a function *only* when the class or one it extends declares an
+accessor. Every other class keeps the plain `__index = class` lookup, which is
+the fast one.
 
 ## What a type library lowers
 

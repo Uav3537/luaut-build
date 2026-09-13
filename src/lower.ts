@@ -143,7 +143,7 @@ class Lowerer {
         // Captured before any of the file's code runs — before its own `table`.
         const captured = [...this.builtins].map(([global, local]) => luau.local([local], [luau.identifier(global)]))
         return {
-            statements: [...captured, ...helpers, ...body],
+            statements: [...captured, ...helpers, ...this.classRuntimeStatements(), ...body],
             exportsName: this.exportsName,
             module: this.info,
             diagnostics: this.diagnostics,
@@ -377,8 +377,9 @@ class Lowerer {
             switch (statement.type) {
                 case "ExportStatement": {
                     const declaration = statement.declaration
-                    if (declaration.type === "FunctionDeclaration") exportBinding(declaration.name, declaration.name.name)
-                    else for (const pattern of declaration.names.flatMap(identifierPatterns)) exportBinding(pattern, pattern.name)
+                    if (declaration.type === "FunctionDeclaration" || declaration.type === "ClassDeclaration") {
+                        exportBinding(declaration.name, declaration.name.name)
+                    } else for (const pattern of declaration.names.flatMap(identifierPatterns)) exportBinding(pattern, pattern.name)
                     break
                 }
                 case "ExportDefaultStatement":
@@ -421,7 +422,8 @@ class Lowerer {
                 for (const pattern of declaration.names.flatMap(identifierPatterns)) {
                     if (!this.isRewritten(pattern)) locals.push(this.name(pattern.name))
                 }
-            } else if (declaration.type === "FunctionDeclaration" && !this.isRewritten(declaration.name)) {
+            } else if ((declaration.type === "FunctionDeclaration" || declaration.type === "ClassDeclaration") &&
+                !this.isRewritten(declaration.name)) {
                 locals.push(this.name(declaration.name.name))
             }
         }
@@ -433,7 +435,15 @@ class Lowerer {
             if (declaration.type === "FunctionDeclaration") {
                 // `function exports.f()` / `function f()`: assigns the export, or
                 // the local declared above, and keeps attributes such as `@native`.
-                hoisted.push(this.functionStatement(this.reference(declaration.name), declaration, declaration.func, false))
+                hoisted.push(this.functionStatement(this.reference(declaration.name), declaration,
+                    this.functionBody(declaration.func), false))
+                continue
+            }
+            if (declaration.type === "ClassDeclaration") {
+                // The class table is built where it is written — its
+                // initializers and its base class have to have run — but the
+                // name is already declared, so anything above it can reach it.
+                body.push(...this.classDeclaration(declaration, "assign"))
                 continue
             }
             switch (declaration.type) {
@@ -525,19 +535,22 @@ class Lowerer {
      *  the block and assigned where they are written. */
     private referencedAhead(statements: readonly T.Statement[]): {
         functions: Set<T.FunctionDeclaration>
+        classes: Set<T.ClassDeclaration>
         variables: Set<T.VariableDeclaration>
         names: string[]
     } {
         const functions = new Set<T.FunctionDeclaration>()
+        const classes = new Set<T.ClassDeclaration>()
         const variables = new Set<T.VariableDeclaration>()
         const names: string[] = []
         const before = (node: T.BaseNode, line: number, column: number): boolean =>
             line < node.line.start || (line === node.line.start && column < node.column.start)
         for (const statement of statements) {
-            if (statement.type === "FunctionDeclaration") {
+            if (statement.type === "FunctionDeclaration" || statement.type === "ClassDeclaration") {
                 const binding = this.bindingByDeclaration.get(statement.name)
                 if (binding?.references.some(r => before(statement.name, r.line.start, r.column.start))) {
-                    functions.add(statement)
+                    if (statement.type === "ClassDeclaration") classes.add(statement)
+                    else functions.add(statement)
                     names.push(this.name(statement.name.name))
                 }
                 continue
@@ -555,7 +568,7 @@ class Lowerer {
             variables.add(statement)
             for (const pattern of patterns) names.push(this.name(pattern.name))
         }
-        return { functions, variables, names }
+        return { functions, classes, variables, names }
     }
 
     private blockStatements(statements: readonly T.Statement[]): L.Statement[] {
@@ -565,10 +578,13 @@ class Lowerer {
             luau.local(ahead.names, []),
             ...statements.flatMap(s => {
                 if (s.type === "FunctionDeclaration" && ahead.functions.has(s)) {
-                    return [this.functionStatement(this.reference(s.name), s, s.func, false)]
+                    return [this.functionStatement(this.reference(s.name), s, this.functionBody(s.func), false)]
                 }
                 if (s.type === "VariableDeclaration" && ahead.variables.has(s)) {
                     return this.variableDeclaration(s, "assign")
+                }
+                if (s.type === "ClassDeclaration" && ahead.classes.has(s)) {
+                    return this.classDeclaration(s, "assign")
                 }
                 return this.statement(s)
             }),
@@ -589,7 +605,13 @@ class Lowerer {
                 body.push(...this.variableDeclaration(statement, "assign"))
             } else if (statement.type === "FunctionDeclaration") {
                 locals.push(this.name(statement.name.name))
-                hoisted.push(this.functionStatement(this.reference(statement.name), statement, statement.func, false))
+                hoisted.push(this.functionStatement(this.reference(statement.name), statement,
+                    this.functionBody(statement.func), false))
+            } else if (statement.type === "ClassDeclaration") {
+                // The name is declared up front; the table itself is built
+                // where the class is written, once its base class exists.
+                locals.push(this.name(statement.name.name))
+                body.push(...this.classDeclaration(statement, "assign"))
             } else {
                 body.push(...this.statement(statement))
             }
@@ -617,6 +639,9 @@ class Lowerer {
 
             case "FunctionDeclarationStatement":
                 return [this.functionDeclarationStatement(node)]
+
+            case "ClassDeclaration":
+                return this.classDeclaration(node, "declare")
 
             case "AssignmentStatement":
                 return this.assignment(node)
@@ -719,16 +744,209 @@ class Lowerer {
     private functionDeclarationStatement(node: T.FunctionDeclarationStatement): L.FunctionDeclarationStatement {
         // `function util.helper()` where `util` is rewritten to `exports.util`:
         // the base becomes `exports`, and the rest of the path follows.
-        const statement = this.functionStatement(this.reference(node.target.base), node, node.func, node.isMethod, node.target.path.map(p => p.name))
+        const statement = this.functionStatement(this.reference(node.target.base), node, this.functionBody(node.func), node.isMethod, node.target.path.map(p => p.name))
         if (!node.target.method) return statement
         return { ...statement, target: { ...statement.target, method: luau.identifier(node.target.method.name) } }
     }
 
     /** `function a.b.c()`, for a target written as an expression. */
+    // ============================================================
+    // `class ... end`
+    // ------------------------------------------------------------
+    // The shape is Lua's own, and the memory model the language
+    // promises: one table per class holding its methods and its
+    // statics, and one table per instance whose metatable points at
+    // it. An instance reaches its class directly — nothing is copied
+    // per instance, and there is no prototype chain of its own.
+    //
+    //     local Dog = __class(Animal)
+    //     function Dog.__init(this, name)
+    //         Animal.__init(this, name)      -- super(name)
+    //         this.breed = "corgi"           -- a field initializer
+    //     end
+    //     function Dog.new(...)
+    //         local this = setmetatable({}, Dog)
+    //         Dog.__init(this, ...)
+    //         return this
+    //     end
+    //     function Dog.speak(this) ... end
+    //
+    // `new Dog(x)` is `Dog.new(x)`, `dog:speak()` passes the instance
+    // as `this`, and `super.speak()` is `Animal.speak(this)` — the
+    // base's own function, run on this instance.
+    // ============================================================
+
+    /** The locals the file's classes are built with, named once. */
+    private classHelpers?: { build: string; accessors: string }
+
+    private classRuntime(): { build: string; accessors: string } {
+        return (this.classHelpers ??= {
+            build: this.names.fresh("luaut_class"),
+            accessors: this.names.fresh("luaut_accessors"),
+        })
+    }
+
+    /** The helpers, as Luau — emitted only in a file that declares a class.
+     *  `__getters`/`__setters` chain to the base's, so a derived class sees
+     *  the accessors it inherits; `__index` only becomes a function for a
+     *  class that has some, which leaves every other class on the plain
+     *  `__index = class` fast path. */
+    private classRuntimeStatements(): L.Statement[] {
+        if (!this.classHelpers) return []
+        const { build, accessors } = this.classHelpers
+        return parseLuau(`
+local function ${build}(base)
+    local class = { __getters = {}, __setters = {} }
+    class.__index = class
+    if base ~= nil then
+        setmetatable(class, { __index = base })
+        setmetatable(class.__getters, { __index = base.__getters })
+        setmetatable(class.__setters, { __index = base.__setters })
+    end
+    return class
+end
+local function ${accessors}(class)
+    if not class.__dynamic and next(class.__getters) == nil and next(class.__setters) == nil then
+        return
+    end
+    class.__dynamic = true
+    class.__index = function(this, key)
+        local getter = class.__getters[key]
+        if getter ~= nil then
+            return getter(this)
+        end
+        return class[key]
+    end
+    class.__newindex = function(this, key, value)
+        local setter = class.__setters[key]
+        if setter ~= nil then
+            setter(this, value)
+            return
+        end
+        rawset(this, key, value)
+    end
+end
+`).body.statements
+    }
+
+    /** The class being lowered, so `super` knows what to name. */
+    private classContext?: T.ClassDeclaration
+
+    private classDeclaration(node: T.ClassDeclaration, mode: Mode): L.Statement[] {
+        const { build, accessors } = this.classRuntime()
+        const self = mode === "declare" ? luau.identifier(this.name(node.name.name)) : this.reference(node.name)
+        const create = luau.call(luau.identifier(build), [node.superclass ? this.reference(node.superclass) : luau.nil()])
+        const out: L.Statement[] = [mode === "declare"
+            ? luau.local([this.name(node.name.name)], [create])
+            : luau.assign([self], [create])]
+
+        const previous = this.classContext
+        this.classContext = node
+        try {
+            for (const member of node.members) {
+                switch (member.type) {
+                    case "ClassField":
+                        // Only a static holds a value here; an instance field
+                        // is assigned per instance, in `__init`.
+                        if (member.isStatic) {
+                            out.push(luau.assign([luau.member(self, member.name.name)],
+                                [member.init ? this.expression(member.init) : luau.nil()]))
+                        }
+                        break
+                    case "ClassMethod":
+                        out.push(this.functionStatement(luau.member(self, member.name.name), member,
+                            this.classFunctionBody(member.func), false))
+                        break
+                    case "ClassAccessor":
+                        out.push(luau.assign(
+                            [luau.index(luau.member(self, member.kind === "get" ? "__getters" : "__setters"),
+                                luau.string(member.name.name))],
+                            [luau.functionExpression(this.classFunctionBody(member.func))]))
+                        break
+                    case "ClassConstructor":
+                        break
+                }
+            }
+            out.push(this.classInit(node, self))
+            out.push(this.classNew(node, self))
+            out.push(luau.callStatement(luau.call(luau.identifier(accessors), [self])))
+        } finally {
+            this.classContext = previous
+        }
+        return out
+    }
+
+    /** `Class.__init(this, ...)` — what every instance of the class runs.
+     *  Kept apart from `new` so `super(...)` can run the base's on the
+     *  instance already being built rather than making a second one. */
+    private classInit(node: T.ClassDeclaration, self: L.Expression): L.Statement {
+        const instance = this.thisName()
+        const initializers = node.members
+            .filter((m): m is T.ClassField => m.type === "ClassField" && !m.isStatic && m.init !== undefined)
+            .map(field => luau.assign(
+                [luau.member(luau.identifier(instance), field.name.name)], [this.expression(field.init!)]))
+
+        const constructor = node.members.find((m): m is T.ClassConstructor => m.type === "ClassConstructor")
+        if (!constructor) {
+            // No constructor of its own: take what the base takes, pass it on.
+            const body = luau.functionBody([instance], [
+                ...(node.superclass
+                    ? [luau.callStatement(luau.call(luau.member(this.reference(node.superclass), "__init"),
+                        [luau.identifier(instance), vararg()]))]
+                    : []),
+                ...initializers,
+            ], true)
+            return this.functionStatement(luau.member(self, "__init"), node, body, false)
+        }
+
+        const body = this.classFunctionBody(constructor.func)
+        // The fields go in after `super(...)`, which is what fills in
+        // everything the base contributes, and before the constructor can use
+        // them. With no base there is nothing to wait for.
+        const statements = body.body.statements
+        const afterSuper = node.superclass ? statements.findIndex(isSuperInit) + 1 : 0
+        statements.splice(Math.max(afterSuper, 0), 0, ...initializers)
+        return this.functionStatement(luau.member(self, "__init"), constructor, body, false)
+    }
+
+    /** `Class.new(...)`: the instance, its metatable, its constructor. */
+    private classNew(node: T.ClassDeclaration, self: L.Expression): L.Statement {
+        const instance = this.thisName()
+        const body = luau.functionBody([], [
+            luau.local([instance], [luau.call(this.builtin("setmetatable"), [luau.table([]), self])]),
+            luau.callStatement(luau.call(luau.member(self, "__init"), [luau.identifier(instance), vararg()])),
+            luau.returns([luau.identifier(instance)]),
+        ], true)
+        return this.functionStatement(luau.member(self, "new"), node, body, false)
+    }
+
+    /** What `this` is called in emitted code. */
+    private thisName(): string {
+        return this.name("this")
+    }
+
+    /** A class method keeps its receiver as a written parameter: `:` supplies
+     *  it at the call site, but the declaration spells it out so `super` and
+     *  `new` can pass it by hand. */
+    private classFunctionBody(func: T.FunctionBody): L.FunctionBody {
+        return this.functionBody(func.isMethod ? { ...func, isMethod: false } : func)
+    }
+
+    /** `super(...)` / `super.m(...)` — the base class, by the name this file
+     *  knows it under. */
+    private superClassReference(node: T.BaseNode): L.Expression {
+        const superclass = this.classContext?.superclass
+        if (!superclass) {
+            this.report(node, "'super' is only available inside a class that extends another")
+            return luau.nil()
+        }
+        return this.reference(superclass)
+    }
+
     private functionStatement(
         target: L.Expression,
         node: T.BaseNode & { attributes?: string[] },
-        func: T.FunctionBody,
+        func: L.FunctionBody,
         isMethod: boolean,
         path: string[] = [],
     ): L.FunctionDeclarationStatement {
@@ -744,7 +962,7 @@ class Lowerer {
                 ...spanOf(node),
             },
             isMethod,
-            func: this.functionBody(func),
+            func,
             attributes: node.attributes,
             ...spanOf(node),
         }
@@ -957,6 +1175,22 @@ class Lowerer {
     // --------------------------------------------------------
 
     private expression(node: T.Expression): L.Expression {
+        // `super` is the base class table, and what is read through it is
+        // run on this instance: `super(a)` is `Base.__init(this, a)` and
+        // `super.m(a)` is `Base.m(this, a)`. Handled before the chain cases,
+        // which would otherwise take `super` for an ordinary object.
+        if (node.type === "CallExpression") {
+            const callee = node.callee
+            const through = callee.type === "SuperExpression" ? "__init"
+                : callee.type === "MemberExpression" && callee.object.type === "SuperExpression" ? callee.property.name
+                : undefined
+            if (through !== undefined) {
+                return luau.call(luau.member(this.superClassReference(node), through), [
+                    luau.identifier(this.thisName()),
+                    ...node.arguments.map(argument => this.expression(argument)),
+                ])
+            }
+        }
         switch (node.type) {
             case "Identifier": return this.reference(node)
             case "NilLiteral": return luau.nil()
@@ -981,6 +1215,14 @@ class Lowerer {
 
             case "UnaryExpression":
                 return luau.unary(node.operator, this.expression(node.argument))
+
+            case "NewExpression":
+                // `new Name(args)` is the class's own `Name.new(args)`.
+                return luau.call(luau.member(this.expression(node.callee), "new"),
+                    node.arguments.map(argument => this.expression(argument)))
+
+            case "SuperExpression":
+                return this.superClassReference(node)
 
             case "MemberExpression":
             case "IndexExpression":
@@ -1255,6 +1497,14 @@ function expandsToMany(e: L.Expression): boolean {
 }
 
 /** `a.b.c` as `["a", "b", "c"]`, or `undefined` for anything else. */
+/** A lowered `super(...)`: the one thing that calls a base class's `__init`. */
+function isSuperInit(statement: L.Statement): boolean {
+    return statement.type === "CallStatement" &&
+        statement.expression.type === "CallExpression" &&
+        statement.expression.callee.type === "MemberExpression" &&
+        statement.expression.callee.property.name === "__init"
+}
+
 function memberChain(e: L.Expression): string[] | undefined {
     if (e.type === "Identifier") return [e.name]
     if (e.type === "MemberExpression") {

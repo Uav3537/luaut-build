@@ -674,6 +674,126 @@ function findLuau(): string | undefined {
     return undefined
 }
 
+// --- classes ----------------------------------------------------------------
+// What a class lowers to is one table per class and one table per instance,
+// with the instance's metatable pointing at the class — so the only way to be
+// sure is to run it.
+{
+    const root = project({
+        "luaut.config.json": JSON.stringify({ types: [], sourceMap: null }),
+        "shape.luaut": [
+            "export class Shape",
+            "    name: string",
+            "    sides = 0",
+            "    static made = 0",
+            "    constructor(name: string)",
+            "        this.name = name",
+            "        Shape.made += 1",
+            "    end",
+            "    function area(): number",
+            "        return 0",
+            "    end",
+            "    function describe(): string",
+            "        return this.name .. \" has area \" .. tostring(this:area())",
+            "    end",
+            "    get label(): string",
+            "        return \"<\" .. this.name .. \">\"",
+            "    end",
+            "    set label(value: string)",
+            "        this.name = value",
+            "    end",
+            "    static function count(): number",
+            "        return Shape.made",
+            "    end",
+            "end",
+            "",
+        ].join("\n"),
+        "main.luaut": [
+            `import { Shape } from "./shape"`,
+            "",
+            "class Square extends Shape",
+            "    side: number",
+            "    sides = 4",
+            "    constructor(side: number)",
+            `        super("square")`,
+            "        this.side = side",
+            "    end",
+            "    function area(): number",
+            "        return this.side * this.side",
+            "    end",
+            "    function describe(): string",
+            `        return super.describe() .. " (square)"`,
+            "    end",
+            "end",
+            "",
+            "-- No constructor of its own: it takes what Square takes.",
+            "class Tile extends Square",
+            "end",
+            "",
+            "const s = new Square(3)",
+            "print(s:describe())",
+            "print(s.label, s.sides, s.side)",
+            "s.label = \"box\"",
+            "print(s:describe())",
+            "",
+            "const t = new Tile(2)",
+            "print(t:describe(), t.label)",
+            "print(Shape.count(), Square.count(), Square.made)",
+            "",
+            "-- The instance points at the class, so a method added to the class",
+            "-- afterwards is there on instances already built.",
+            "print(getmetatable(s) == Square, getmetatable(t) == Tile)",
+            "",
+        ].join("\n"),
+    })
+    const result = await bundle({ entry: join(root, "main.luaut") })
+    check("class: the bundle type-checks", result.diagnostics.map(d => d.message), [])
+    runs("class: instances, inheritance, super, accessors and statics", result, [
+        "square has area 9 (square)",
+        "<square>\t4\t3",
+        "box has area 9 (square)",
+        "square has area 4 (square)\t<square>",
+        "2\t2\t2",
+        "true\ttrue",
+    ])
+}
+
+// A class with no accessors anywhere in its chain keeps the plain
+// `__index = class` lookup: the metatable is the class table itself.
+await lowers("class: the simple case is the plain Lua idiom",
+    [
+        "class Counter",
+        "    n = 0",
+        "    function bump(): number",
+        "        this.n += 1",
+        "        return this.n",
+        "    end",
+        "end",
+    ].join("\n"),
+    "local function luaut_class(base) local class = { __getters = {}, __setters = {} }; class.__index = class; "
+    + "if base ~= nil then setmetatable(class, { __index = base }); setmetatable(class.__getters, { __index = base.__getters }); "
+    + "setmetatable(class.__setters, { __index = base.__setters }); end; return class; end; "
+    + "local function luaut_accessors(class) "
+    + "if not class.__dynamic and next(class.__getters) == nil and next(class.__setters) == nil then return; end; "
+    + "class.__dynamic = true; "
+    + "class.__index = function(this, key) local getter = class.__getters[key]; if getter ~= nil then return getter(this); end; return class[key]; end; "
+    + "class.__newindex = function(this, key, value) local setter = class.__setters[key]; if setter ~= nil then setter(this, value); return; end; rawset(this, key, value); end; "
+    + "end; "
+    + "local Counter = luaut_class(nil); "
+    + "function Counter.bump(this) this.n += 1; return this.n; end; "
+    + "function Counter.__init(this, ...) this.n = 0; end; "
+    + "function Counter.new(...) local this = setmetatable({}, Counter); Counter.__init(this, ...); return this; end; "
+    + "luaut_accessors(Counter);")
+
+// `new` is the class's own `new`, and nothing more.
+await lowers("class: new is a call of the class's own constructor",
+    [
+        "declare class Vec { x: number }",
+        "declare Vec: { new: (x: number) -> Vec }",
+        "const v = new Vec(1)",
+    ].join("\n"),
+    "local v = Vec.new(1);")
+
 for (const failure of failures) console.log(`FAIL ${failure}`)
 const note = luauBinary ? "" : ` (${skipped} runs skipped: no Luau interpreter; set LUAU to run them)`
 console.log(`\n${passed} passed, ${failures.length} failed${note}`)
