@@ -37,7 +37,7 @@
   "type": "module",
   "dependencies": {
     "luau-parser": "^1.0.3",
-    "luaut-parser": "^5.0.0"
+    "luaut-parser": "^5.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.2",
